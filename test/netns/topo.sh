@@ -35,10 +35,16 @@ die() { echo "topo.sh: $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "must run as root (sudo)"
 
 # apply_netem IFACE NS RATE DELAY JITTER LOSS
+# Falls back to plain tbf rate limiting when the kernel lacks sch_netem
+# (common in containers); delay/loss emulation then requires a CI runner.
 apply_netem() {
     local iface=$1 ns=$2 rate=$3 delay=$4 jitter=$5 loss=$6
-    nsx "$ns" tc qdisc replace dev "$iface" root netem \
-        rate "$rate" delay "$delay" "$jitter" loss random "$loss"
+    if ! nsx "$ns" tc qdisc replace dev "$iface" root netem \
+        rate "$rate" delay "$delay" "$jitter" loss random "$loss" 2>/dev/null; then
+        echo "warn: netem unavailable, rate-only shaping on $ns/$iface" >&2
+        nsx "$ns" tc qdisc replace dev "$iface" root tbf \
+            rate "$rate" burst 64kbit latency 100ms
+    fi
 }
 
 # link_profile N RATE DELAY JITTER LOSS - shape wanN in both directions
@@ -94,6 +100,8 @@ up() {
         ip link add "wan$n" netns "$ROUTER" type veth peer name "sim$n" netns "$WANSIM"
         nsx "$ROUTER" ip addr add "10.11.$n.2/24" dev "wan$n"
         nsx "$WANSIM" ip addr add "10.11.$n.1/24" dev "sim$n"
+        nsx "$ROUTER" ip link set "wan$n" up
+        nsx "$WANSIM" ip link set "sim$n" up
         # Per-WAN routing table: reach the cloud from this WAN's source address.
         nsx "$ROUTER" ip route add 10.10.0.0/24 via "10.11.$n.1" dev "wan$n" table "$((100 + n))"
         nsx "$ROUTER" ip rule add from "10.11.$n.2" lookup "$((100 + n))"

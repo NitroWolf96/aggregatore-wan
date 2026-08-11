@@ -1,0 +1,31 @@
+# treccia-client configuration.
+# Generate keys with: treccia-client genkey | tee privkey | treccia-client pubkey
+
+tunnel:
+  interface: treccia0
+  # MTU 1344 = 1428 (typical 4G APN MTU) - 84 bytes of worst-case overhead.
+  mtu: 1344
+  address: 10.200.0.2/24
+  private_key: "REPLACE_WITH_CLIENT_PRIVATE_KEY"
+  peer_public_key: "REPLACE_WITH_SERVER_PUBLIC_KEY"
+  # Extra networks routed into the tunnel. To send all traffic through it,
+  # prefer two halves over replacing the default route:
+  # routes: ["0.0.0.0/1", "128.0.0.0/1"]
+  routes: []
+
+# Public address of the aggregation server (single UDP port for all paths).
+server_addr: "203.0.113.10:51820"
+
+# Shared secret authenticating the control plane (HELLO/PROBE/CTRL).
+control_psk: "REPLACE_WITH_A_LONG_RANDOM_STRING"
+
+# One entry per WAN uplink. bind is a source IP on that WAN's interface;
+# policy routing (ip rule from <bind> ...) must steer it out of that WAN.
+paths:
+  - name: fiber
+    bind: 192.168.1.10
+  - name: lte
+    bind: 192.168.8.10
+
+dashboard:
+  listen: 127.0.0.1:8080

@@ -1,0 +1,22 @@
+# treccia-server configuration.
+# Generate keys with: treccia-server genkey | tee privkey | treccia-server pubkey
+
+tunnel:
+  interface: treccia0
+  mtu: 1344
+  address: 10.200.0.1/24
+  private_key: "REPLACE_WITH_SERVER_PRIVATE_KEY"
+  peer_public_key: "REPLACE_WITH_CLIENT_PUBLIC_KEY"
+
+# All client paths arrive on this single UDP port.
+listen: ":51820"
+
+control_psk: "REPLACE_WITH_A_LONG_RANDOM_STRING"
+
+# NAT of the inner traffic is host configuration, e.g.:
+#   sysctl -w net.ipv4.ip_forward=1
+#   iptables -t nat -A POSTROUTING -s 10.200.0.0/24 -o eth0 -j MASQUERADE
+# (deploy/terraform/oracle/cloud-init.yaml does this automatically)
+
+dashboard:
+  listen: 127.0.0.1:8080
