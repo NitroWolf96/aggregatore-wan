@@ -11,6 +11,7 @@ import (
 
 	"github.com/nitrowolf96/aggregatore-wan/internal/buffers"
 	"github.com/nitrowolf96/aggregatore-wan/internal/control"
+	"github.com/nitrowolf96/aggregatore-wan/internal/reorder"
 	"github.com/nitrowolf96/aggregatore-wan/internal/wgbridge"
 	"github.com/nitrowolf96/aggregatore-wan/internal/wire"
 )
@@ -28,6 +29,16 @@ func newServerState() *serverState {
 	return &serverState{sessions: make(map[uint32]*Session)}
 }
 
+// pathState is the server-side view of one client path.
+type pathState struct {
+	addr   netip.AddrPort
+	lastRx int64 // unix nanos of the last inbound datagram on this path
+}
+
+// pathStaleAfter excludes paths from return striping when nothing has
+// arrived on them recently (idle paths still get a HELLO refresh every 15s).
+const pathStaleAfter = 45 * time.Second
+
 // Session is the server-side view of one client and its registered paths.
 type Session struct {
 	ID       uint32
@@ -35,26 +46,40 @@ type Session struct {
 	Ep       *wgbridge.SessionEndpoint
 
 	mu        sync.RWMutex
-	addrs     map[uint8]netip.AddrPort
-	active    atomic.Uint32 // path id of the most recent inbound packet
+	paths     map[uint8]*pathState
 	lastSeen  atomic.Int64
 	globalSeq atomic.Uint32
+	rr        atomic.Uint32
 	pathSeq   [256]atomic.Uint32
+	reorder   *reorder.Buffer[buffers.Packet]
 }
 
-func (s *Session) setAddr(pathID uint8, addr netip.AddrPort) {
+func (s *Session) touchPath(pathID uint8, addr netip.AddrPort, now int64) {
 	s.mu.Lock()
-	if s.addrs[pathID] != addr {
-		s.addrs[pathID] = addr
+	ps := s.paths[pathID]
+	if ps == nil {
+		ps = &pathState{}
+		s.paths[pathID] = ps
 	}
+	ps.addr = addr // per-path roaming: the newest source wins
+	ps.lastRx = now
 	s.mu.Unlock()
 }
 
-func (s *Session) addr(pathID uint8) (netip.AddrPort, bool) {
+// alivePaths returns the ids and addresses of recently active paths.
+func (s *Session) alivePaths(now int64) ([]uint8, []netip.AddrPort) {
 	s.mu.RLock()
-	a, ok := s.addrs[pathID]
-	s.mu.RUnlock()
-	return a, ok
+	defer s.mu.RUnlock()
+	ids := make([]uint8, 0, len(s.paths))
+	addrs := make([]netip.AddrPort, 0, len(s.paths))
+	cutoff := now - pathStaleAfter.Nanoseconds()
+	for id, ps := range s.paths {
+		if ps.lastRx >= cutoff {
+			ids = append(ids, id)
+			addrs = append(addrs, ps.addr)
+		}
+	}
+	return ids, addrs
 }
 
 // Listen opens the single aggregation socket and starts the server loops.
@@ -118,16 +143,13 @@ func (e *Engine) handleServerDatagram(slab *[]byte, n int, src netip.AddrPort) {
 			buffers.Put(slab)
 			return
 		}
-		// Per-path roaming, like WireGuard: the newest source wins.
-		sess.setAddr(d.PathID, src)
-		sess.active.Store(uint32(d.PathID))
-		sess.lastSeen.Store(time.Now().UnixNano())
+		now := time.Now().UnixNano()
+		sess.touchPath(d.PathID, src, now)
+		sess.lastSeen.Store(now)
 		e.Stats.RxPackets.Add(1)
 		e.Stats.RxBytes.Add(uint64(n))
 		pkt := buffers.Packet{Slab: slab, Off: d.Len(), Len: len(payload)}
-		if !e.bind.Deliver(pkt, sess.Ep) {
-			e.Stats.RxDropQueue.Add(1)
-		}
+		sess.reorder.Push(d.GlobalSeq, pkt)
 	case wire.TypeHello:
 		e.handleHello(dgram, h, src)
 		buffers.Put(slab)
@@ -151,11 +173,13 @@ func (e *Engine) handleHello(dgram []byte, h wire.Header, src netip.AddrPort) {
 	st.mu.Lock()
 	sess := st.sessions[m.Session]
 	if sess == nil {
+		ep := &wgbridge.SessionEndpoint{Session: m.Session}
 		sess = &Session{
 			ID:       m.Session,
 			ClientID: m.ClientID,
-			Ep:       &wgbridge.SessionEndpoint{Session: m.Session},
-			addrs:    make(map[uint8]netip.AddrPort),
+			Ep:       ep,
+			paths:    make(map[uint8]*pathState),
+			reorder:  e.newReorder(ep),
 		}
 		st.sessions[m.Session] = sess
 		e.log.Info("session created", "session", m.Session, "src", src)
@@ -166,9 +190,9 @@ func (e *Engine) handleHello(dgram []byte, h wire.Header, src netip.AddrPort) {
 		e.Stats.RxDropUnknown.Add(1)
 		return
 	}
-	sess.setAddr(hh.PathID, src)
-	sess.active.Store(uint32(hh.PathID))
-	sess.lastSeen.Store(time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	sess.touchPath(hh.PathID, src, now)
+	sess.lastSeen.Store(now)
 
 	ack := control.EncodeHello(
 		wire.Header{PathID: hh.PathID},
@@ -190,13 +214,14 @@ func (e *Engine) removeSessionPath(sessionID uint32, pathID uint8) {
 		return
 	}
 	sess.mu.Lock()
-	delete(sess.addrs, pathID)
-	empty := len(sess.addrs) == 0
+	delete(sess.paths, pathID)
+	empty := len(sess.paths) == 0
 	sess.mu.Unlock()
 	if empty {
 		e.server.mu.Lock()
 		delete(e.server.sessions, sessionID)
 		e.server.mu.Unlock()
+		sess.reorder.Close()
 		e.log.Info("session removed", "session", sessionID)
 	}
 }
@@ -215,6 +240,7 @@ func (e *Engine) sessionReaper() {
 		for id, s := range e.server.sessions {
 			if s.lastSeen.Load() < cutoff {
 				delete(e.server.sessions, id)
+				s.reorder.Close()
 				e.log.Info("session expired", "session", id)
 			}
 		}
@@ -223,22 +249,22 @@ func (e *Engine) sessionReaper() {
 }
 
 // serverSend is the wgbridge SendFunc of the server: return ciphertext is
-// sent back to the client on the most recently active path (the scheduler
-// takes over in milestone M2).
+// striped round-robin across the client's recently active paths (the
+// adaptive weighted scheduler replaces plain round-robin in milestone M3).
 func (e *Engine) serverSend(bufs [][]byte, ep *wgbridge.SessionEndpoint) error {
 	sess := e.lookupSession(ep.Session)
 	if sess == nil {
 		e.Stats.TxDropNoPath.Add(uint64(len(bufs)))
 		return nil
 	}
-	pathID := uint8(sess.active.Load())
-	addr, ok := sess.addr(pathID)
-	if !ok {
+	ids, addrs := sess.alivePaths(time.Now().UnixNano())
+	if len(ids) == 0 {
 		e.Stats.TxDropNoPath.Add(uint64(len(bufs)))
 		return nil
 	}
 	for _, ct := range bufs {
-		e.serverSendData(sess, pathID, addr, ct)
+		i := int(sess.rr.Add(1)) % len(ids)
+		e.serverSendData(sess, ids[i], addrs[i], ct)
 	}
 	return nil
 }

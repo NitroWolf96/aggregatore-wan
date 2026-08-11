@@ -99,8 +99,7 @@ func (e *Engine) WaitReady(timeout time.Duration) error {
 	return errors.New("engine: no path registered before timeout")
 }
 
-// activePath returns the sending path. Milestone M2 replaces this with the
-// striping scheduler; for now it is the first registered path.
+// activePath returns any usable path (used for readiness checks).
 func (e *Engine) activePath() *Path {
 	e.pathsMu.RLock()
 	defer e.pathsMu.RUnlock()
@@ -112,14 +111,30 @@ func (e *Engine) activePath() *Path {
 	return nil
 }
 
-// clientSend is the wgbridge SendFunc: WireGuard ciphertext leaves here.
+// sendablePaths snapshots the registered paths.
+func (e *Engine) sendablePaths() []*Path {
+	e.pathsMu.RLock()
+	defer e.pathsMu.RUnlock()
+	out := make([]*Path, 0, len(e.paths))
+	for _, p := range e.paths {
+		if p.registered.Load() {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// clientSend is the wgbridge SendFunc: WireGuard ciphertext leaves here,
+// striped round-robin across the registered paths (the adaptive weighted
+// scheduler replaces plain round-robin in milestone M3).
 func (e *Engine) clientSend(bufs [][]byte, _ *wgbridge.SessionEndpoint) error {
-	p := e.activePath()
-	if p == nil {
+	paths := e.sendablePaths()
+	if len(paths) == 0 {
 		e.Stats.TxDropNoPath.Add(uint64(len(bufs)))
 		return nil
 	}
 	for _, ct := range bufs {
+		p := paths[int(e.rr.Add(1))%len(paths)]
 		e.sendDataOn(p, e.session, e.globalSeq.Add(1), ct)
 	}
 	return nil
@@ -183,9 +198,7 @@ func (e *Engine) handleClientDatagram(p *Path, slab *[]byte, n int) {
 		e.Stats.RxPackets.Add(1)
 		e.Stats.RxBytes.Add(uint64(n))
 		pkt := buffers.Packet{Slab: slab, Off: d.Len(), Len: len(payload)}
-		if !e.bind.Deliver(pkt, e.clientEp) {
-			e.Stats.RxDropQueue.Add(1)
-		}
+		e.reorderBuf.Push(d.GlobalSeq, pkt)
 	case wire.TypeHelloAck:
 		if hh, m, ok := control.ParseHello(dgram, e.mac); ok &&
 			hh.PathID == p.ID && m.Session == e.session && m.ClientID == e.clientID &&

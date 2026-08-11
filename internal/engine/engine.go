@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/nitrowolf96/aggregatore-wan/internal/buffers"
+	"github.com/nitrowolf96/aggregatore-wan/internal/reorder"
 	"github.com/nitrowolf96/aggregatore-wan/internal/wgbridge"
 	"github.com/nitrowolf96/aggregatore-wan/internal/wire"
 )
@@ -62,10 +64,12 @@ type Engine struct {
 	Stats Counters
 
 	// Client state.
-	pathsMu   sync.RWMutex
-	paths     []*Path
-	clientEp  *wgbridge.SessionEndpoint
-	globalSeq atomic.Uint32
+	pathsMu    sync.RWMutex
+	paths      []*Path
+	clientEp   *wgbridge.SessionEndpoint
+	globalSeq  atomic.Uint32
+	rr         atomic.Uint32
+	reorderBuf *reorder.Buffer[buffers.Packet]
 
 	// Server state.
 	server *serverState
@@ -85,11 +89,26 @@ func New(cfg Config) *Engine {
 	if cfg.Mode == ModeClient {
 		e.clientEp = &wgbridge.SessionEndpoint{Session: cfg.Session}
 		e.bind = wgbridge.NewEngineBind(e.clientSend)
+		e.reorderBuf = e.newReorder(e.clientEp)
 	} else {
 		e.server = newServerState()
 		e.bind = wgbridge.NewEngineBind(e.serverSend)
 	}
 	return e
+}
+
+// newReorder builds a resequencing buffer that releases ciphertext (in
+// order, or as late passthrough) up to WireGuard for the given endpoint.
+func (e *Engine) newReorder(ep *wgbridge.SessionEndpoint) *reorder.Buffer[buffers.Packet] {
+	return reorder.New(
+		func(pkt buffers.Packet, _ bool) {
+			if !e.bind.Deliver(pkt, ep) {
+				e.Stats.RxDropQueue.Add(1)
+			}
+		},
+		func(pkt buffers.Packet) { pkt.Release() },
+		nil,
+	)
 }
 
 // Bind returns the conn.Bind to hand to wireguard-go.
@@ -116,4 +135,14 @@ func (e *Engine) Close() {
 		e.server.sock.Close()
 	}
 	e.wg.Wait()
+	if e.reorderBuf != nil {
+		e.reorderBuf.Close()
+	}
+	if e.server != nil {
+		e.server.mu.Lock()
+		for _, s := range e.server.sessions {
+			s.reorder.Close()
+		}
+		e.server.mu.Unlock()
+	}
 }
