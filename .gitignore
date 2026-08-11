@@ -1,0 +1,13 @@
+/bin/
+*.test
+*.out
+coverage.*
+/dist/
+.idea/
+.vscode/
+*.log
+testdata/fuzz/
+deploy/terraform/**/.terraform/
+deploy/terraform/**/*.tfstate*
+deploy/terraform/**/*.tfvars
+!deploy/terraform/**/*.example.tfvars
