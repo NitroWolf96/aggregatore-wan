@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Treccia</title>
+<style>
+  :root {
+    --bg: #0f1418; --panel: #161d24; --edge: #24303a; --text: #d7e0e7;
+    --dim: #8496a3; --accent: #4cc38a; --warn: #e5a50a; --bad: #e05d5d;
+    --blue: #5aa9e6;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, sans-serif; padding: 1.2rem; }
+  h1 { font-size: 1.25rem; margin: 0 0 .2rem; letter-spacing: .02em; }
+  h1 small { color: var(--dim); font-weight: 400; margin-left: .6rem; }
+  .grid { display: grid; gap: .8rem; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); margin-top: 1rem; }
+  .card { background: var(--panel); border: 1px solid var(--edge); border-radius: 10px; padding: .9rem 1rem; }
+  .card h2 { font-size: .8rem; margin: 0 0 .55rem; color: var(--dim);
+             text-transform: uppercase; letter-spacing: .08em; display: flex; align-items: center; gap: .5rem; }
+  .dot { width: .6rem; height: .6rem; border-radius: 50%; background: var(--bad); display: inline-block; }
+  .dot.up { background: var(--accent); }
+  .kv { display: grid; grid-template-columns: 1fr auto; gap: .1rem .8rem; font-variant-numeric: tabular-nums; }
+  .kv span:nth-child(odd) { color: var(--dim); }
+  .kv span:nth-child(even) { text-align: right; }
+  .big { font-size: 1.7rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .unit { color: var(--dim); font-size: .85rem; margin-left: .25rem; }
+  .bar { height: 6px; border-radius: 3px; background: var(--edge); margin-top: .5rem; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--blue); }
+  canvas { width: 100%; height: 72px; display: block; margin-top: .4rem; }
+  #topline { display: flex; gap: 2rem; flex-wrap: wrap; margin-top: .6rem; }
+  .stale { opacity: .45; }
+</style>
+</head>
+<body>
+<h1>Treccia <small id="mode">connecting…</small></h1>
+<div id="topline">
+  <div><div class="big" id="down">–<span class="unit">Mbit/s ↓</span></div></div>
+  <div><div class="big" id="up">–<span class="unit">Mbit/s ↑</span></div></div>
+  <div><div class="big" id="egress">–<span class="unit">GB egress</span></div></div>
+</div>
+<canvas id="chart" height="72"></canvas>
+<div class="grid" id="paths"></div>
+<div class="grid">
+  <div class="card"><h2>Reorder</h2><div class="kv" id="reorder"></div></div>
+  <div class="card"><h2>FEC</h2><div class="kv" id="fec"></div></div>
+  <div class="card"><h2>Engine</h2><div class="kv" id="engine"></div></div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const fmt = (v, d=1) => v == null ? "–" : (+v).toFixed(d);
+const hist = { t: [], up: [], down: [] };
+let prev = null;
+
+function kv(el, pairs) {
+  el.innerHTML = pairs.map(([k, v]) => `<span>${k}</span><span>${v}</span>`).join("");
+}
+
+function pathCard(p) {
+  const share = p.weight_mbps > 0 && window.totalWeight > 0
+    ? 100 * p.weight_mbps / window.totalWeight : 0;
+  return `<div class="card ${p.up ? "" : "stale"}">
+    <h2><span class="dot ${p.up ? "up" : ""}"></span>${p.name || "path " + p.id}</h2>
+    <div class="kv">
+      <span>SRTT</span><span>${fmt(p.srtt_ms)} ms ± ${fmt(p.rttvar_ms)}</span>
+      <span>Loss</span><span>${fmt(p.loss_pct, 2)} %</span>
+      <span>Capacity</span><span>${fmt(p.capacity_mbps)} Mbit/s</span>
+      <span>OWD Δ</span><span>${fmt(p.owd_avg_ms)} ms ~${fmt(p.owd_jitter_ms)}</span>
+      <span>Pkts tx/rx</span><span>${p.tx_packets} / ${p.rx_packets}</span>
+    </div>
+    <div class="bar"><i style="width:${share}%"></i></div>
+  </div>`;
+}
+
+function draw() {
+  const c = $("chart"), ctx = c.getContext("2d");
+  c.width = c.clientWidth * devicePixelRatio;
+  const W = c.width, H = c.height * devicePixelRatio;
+  c.height = H;
+  ctx.clearRect(0, 0, W, H);
+  const n = hist.up.length;
+  if (n < 2) return;
+  const max = Math.max(1, ...hist.up, ...hist.down);
+  const line = (arr, color) => {
+    ctx.beginPath();
+    arr.forEach((v, i) => {
+      const x = i / (n - 1) * W, y = H - v / max * (H - 6) - 3;
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.strokeStyle = color; ctx.lineWidth = 2 * devicePixelRatio; ctx.stroke();
+  };
+  line(hist.down, "#5aa9e6");
+  line(hist.up, "#4cc38a");
+}
+
+function render(m) {
+  $("mode").textContent = m.mode + (m.session ? " · session " + m.session : "");
+  if (prev && m.now_ms > prev.now_ms) {
+    const dt = (m.now_ms - prev.now_ms) / 1000;
+    const up = (m.tx_bytes - prev.tx_bytes) * 8 / dt / 1e6;
+    const down = (m.rx_bytes - prev.rx_bytes) * 8 / dt / 1e6;
+    $("up").firstChild.textContent = fmt(up);
+    $("down").firstChild.textContent = fmt(down);
+    hist.up.push(up); hist.down.push(down);
+    if (hist.up.length > 600) { hist.up.shift(); hist.down.shift(); }
+    draw();
+  }
+  $("egress").firstChild.textContent = fmt(m.tx_bytes / 1e9, 2);
+
+  const paths = m.paths || (m.sessions || []).flatMap(s => s.paths);
+  window.totalWeight = paths.reduce((a, p) => a + (p.up ? p.weight_mbps : 0), 0);
+  $("paths").innerHTML = paths.map(pathCard).join("");
+
+  const r = m.reorder || (m.sessions && m.sessions[0] && m.sessions[0].reorder);
+  if (r) kv($("reorder"), [
+    ["Delivered", r.Delivered], ["Depth", r.Depth], ["Duplicates", r.Duplicates],
+    ["Late", r.Late], ["Timed out", r.TimedOut], ["Overflows", r.Overflows]]);
+
+  const f = m.fec || (m.sessions && m.sessions[0] && m.sessions[0].fec);
+  kv($("fec"), f ? [["Geometry", f.params], ["Groups", f.groups],
+    ["Parity sent", f.parity], ["Recovered", f.recovered]] : [["FEC", "disabled"]]);
+
+  kv($("engine"), [
+    ["Tx pkts", m.tx_packets], ["Rx pkts", m.rx_packets],
+    ["Drops no-path", m.drop_no_path], ["Drops queue", m.drop_queue],
+    ["Classifier hit/miss", `${m.corr_hits}/${m.corr_miss}`]]);
+  prev = m;
+}
+
+const token = new URLSearchParams(location.search).get("token");
+const qs = token ? "?token=" + encodeURIComponent(token) : "";
+const es = new EventSource("/events" + qs);
+es.onmessage = ev => render(JSON.parse(ev.data));
+es.onerror = () => { $("mode").textContent = "reconnecting…"; };
+</script>
+</body>
+</html>

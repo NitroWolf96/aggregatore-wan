@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"flag"
@@ -17,6 +18,7 @@ import (
 	"github.com/nitrowolf96/aggregatore-wan/internal/classify"
 	"github.com/nitrowolf96/aggregatore-wan/internal/cli"
 	"github.com/nitrowolf96/aggregatore-wan/internal/config"
+	"github.com/nitrowolf96/aggregatore-wan/internal/dashboard"
 	"github.com/nitrowolf96/aggregatore-wan/internal/engine"
 	"github.com/nitrowolf96/aggregatore-wan/internal/wgbridge"
 	"github.com/nitrowolf96/aggregatore-wan/internal/wire"
@@ -107,8 +109,12 @@ func main() {
 	}
 	log.Info("treccia-client up", "version", version, "session", session, "tun", name, "paths", len(cfg.Paths))
 
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if cfg.Dashboard.Listen != "" {
+		go dashboard.Serve(ctx, cfg.Dashboard.Listen, cfg.Dashboard.Token,
+			func() any { return eng.Metrics() }, log)
+	}
+	<-ctx.Done()
 	log.Info("shutting down")
 }

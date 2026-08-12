@@ -213,6 +213,13 @@ func (e *Encoder) closeLocked() {
 	e.shards = e.shards[:0]
 }
 
+// Stats reads the encoder counters and the active geometry.
+func (e *Encoder) Stats() (groups, parity uint64, params Params) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.GroupsClosed, e.ParityEmitted, e.params
+}
+
 // RecoverFunc receives a repaired packet (sequence + ciphertext).
 type RecoverFunc func(seq uint32, ct []byte)
 

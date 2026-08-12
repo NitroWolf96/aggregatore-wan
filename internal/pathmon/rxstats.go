@@ -66,6 +66,13 @@ func (r *RxStats) Report() (highest, pkts uint32, bytes uint64, owdMinUS, owdAvg
 	return r.highest, r.pkts, r.bytes, uint32(min), uint32(int32(r.owdEwma)), true
 }
 
+// Peek reads the counters without consuming the report window.
+func (r *RxStats) Peek() (pkts uint32, bytes uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.pkts, r.bytes
+}
+
 // OwdView returns the delay estimate for hold sizing. ok is false without
 // recent data (within staleness).
 func (r *RxStats) OwdView(now time.Time, staleness time.Duration) (ewmaUS, jitterUS float64, ok bool) {
