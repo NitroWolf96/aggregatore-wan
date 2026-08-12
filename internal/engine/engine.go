@@ -14,6 +14,7 @@ import (
 
 	"github.com/nitrowolf96/aggregatore-wan/internal/buffers"
 	"github.com/nitrowolf96/aggregatore-wan/internal/reorder"
+	"github.com/nitrowolf96/aggregatore-wan/internal/sched"
 	"github.com/nitrowolf96/aggregatore-wan/internal/wgbridge"
 	"github.com/nitrowolf96/aggregatore-wan/internal/wire"
 )
@@ -68,7 +69,7 @@ type Engine struct {
 	paths      []*Path
 	clientEp   *wgbridge.SessionEndpoint
 	globalSeq  atomic.Uint32
-	rr         atomic.Uint32
+	wsched     *sched.Weighted
 	reorderBuf *reorder.Buffer[buffers.Packet]
 
 	// Server state.
@@ -90,6 +91,7 @@ func New(cfg Config) *Engine {
 		e.clientEp = &wgbridge.SessionEndpoint{Session: cfg.Session}
 		e.bind = wgbridge.NewEngineBind(e.clientSend)
 		e.reorderBuf = e.newReorder(e.clientEp)
+		e.wsched = sched.NewWeighted()
 	} else {
 		e.server = newServerState()
 		e.bind = wgbridge.NewEngineBind(e.serverSend)
@@ -119,6 +121,11 @@ func (e *Engine) txTS() uint32 {
 	return uint32(time.Since(e.start).Microseconds())
 }
 
+// nowUS returns the sender clock in microseconds (full width, for probes).
+func (e *Engine) nowUS() uint64 {
+	return uint64(time.Since(e.start).Microseconds())
+}
+
 // Close stops all loops and sockets. On the client a best-effort BYE is
 // sent on every registered path first.
 func (e *Engine) Close() {
@@ -128,7 +135,7 @@ func (e *Engine) Close() {
 	e.cancel()
 	e.pathsMu.RLock()
 	for _, p := range e.paths {
-		p.conn.Close()
+		p.close()
 	}
 	e.pathsMu.RUnlock()
 	if e.server != nil && e.server.sock != nil {

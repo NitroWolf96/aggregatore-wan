@@ -11,13 +11,19 @@ import (
 
 	"github.com/nitrowolf96/aggregatore-wan/internal/buffers"
 	"github.com/nitrowolf96/aggregatore-wan/internal/control"
+	"github.com/nitrowolf96/aggregatore-wan/internal/pathmon"
 	"github.com/nitrowolf96/aggregatore-wan/internal/reorder"
+	"github.com/nitrowolf96/aggregatore-wan/internal/sched"
 	"github.com/nitrowolf96/aggregatore-wan/internal/wgbridge"
 	"github.com/nitrowolf96/aggregatore-wan/internal/wire"
 )
 
 // sessionTimeout removes sessions that have been completely silent.
 const sessionTimeout = 5 * time.Minute
+
+// pathStaleAfter excludes paths from return traffic when nothing has
+// arrived on them recently (probes keep live paths warm at 100ms).
+const pathStaleAfter = 45 * time.Second
 
 type serverState struct {
 	sock     *net.UDPConn
@@ -31,13 +37,13 @@ func newServerState() *serverState {
 
 // pathState is the server-side view of one client path.
 type pathState struct {
+	id     uint8
 	addr   netip.AddrPort
 	lastRx int64 // unix nanos of the last inbound datagram on this path
-}
 
-// pathStaleAfter excludes paths from return striping when nothing has
-// arrived on them recently (idle paths still get a HELLO refresh every 15s).
-const pathStaleAfter = 45 * time.Second
+	Link *pathmon.Link
+	Rx   *pathmon.RxStats
+}
 
 // Session is the server-side view of one client and its registered paths.
 type Session struct {
@@ -49,37 +55,44 @@ type Session struct {
 	paths     map[uint8]*pathState
 	lastSeen  atomic.Int64
 	globalSeq atomic.Uint32
-	rr        atomic.Uint32
 	pathSeq   [256]atomic.Uint32
 	reorder   *reorder.Buffer[buffers.Packet]
+	wsched    *sched.Weighted
 }
 
-func (s *Session) touchPath(pathID uint8, addr netip.AddrPort, now int64) {
+// touchPath refreshes (or creates) the state of one path; the newest source
+// address wins (per-path roaming, like WireGuard).
+func (s *Session) touchPath(pathID uint8, addr netip.AddrPort, now int64) *pathState {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	ps := s.paths[pathID]
 	if ps == nil {
-		ps = &pathState{}
+		ps = &pathState{id: pathID, Link: pathmon.NewLink(), Rx: &pathmon.RxStats{}}
 		s.paths[pathID] = ps
 	}
-	ps.addr = addr // per-path roaming: the newest source wins
+	ps.addr = addr
 	ps.lastRx = now
-	s.mu.Unlock()
+	return ps
 }
 
-// alivePaths returns the ids and addresses of recently active paths.
-func (s *Session) alivePaths(now int64) ([]uint8, []netip.AddrPort) {
+func (s *Session) path(pathID uint8) *pathState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	ids := make([]uint8, 0, len(s.paths))
-	addrs := make([]netip.AddrPort, 0, len(s.paths))
+	return s.paths[pathID]
+}
+
+// alivePaths snapshots the recently active paths.
+func (s *Session) alivePaths(now int64) []*pathState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*pathState, 0, len(s.paths))
 	cutoff := now - pathStaleAfter.Nanoseconds()
-	for id, ps := range s.paths {
+	for _, ps := range s.paths {
 		if ps.lastRx >= cutoff {
-			ids = append(ids, id)
-			addrs = append(addrs, ps.addr)
+			out = append(out, ps)
 		}
 	}
-	return ids, addrs
+	return out
 }
 
 // Listen opens the single aggregation socket and starts the server loops.
@@ -93,15 +106,13 @@ func (e *Engine) Listen(listen string) error {
 		return err
 	}
 	e.server.sock = sock
-	e.wg.Add(2)
-	go func() {
-		defer e.wg.Done()
-		e.serverRxLoop()
-	}()
-	go func() {
-		defer e.wg.Done()
-		e.sessionReaper()
-	}()
+	for _, loop := range []func(){e.serverRxLoop, e.serverControlLoop, e.sessionReaper} {
+		e.wg.Add(1)
+		go func() {
+			defer e.wg.Done()
+			loop()
+		}()
+	}
 	e.log.Info("listening", "addr", sock.LocalAddr())
 	return nil
 }
@@ -129,6 +140,7 @@ func (e *Engine) handleServerDatagram(slab *[]byte, n int, src netip.AddrPort) {
 		buffers.Put(slab)
 		return
 	}
+	now := time.Now()
 	switch h.Type {
 	case wire.TypeData:
 		d, payload, err := wire.ParseDataHeader(dgram)
@@ -143,27 +155,55 @@ func (e *Engine) handleServerDatagram(slab *[]byte, n int, src netip.AddrPort) {
 			buffers.Put(slab)
 			return
 		}
-		now := time.Now().UnixNano()
-		sess.touchPath(d.PathID, src, now)
-		sess.lastSeen.Store(now)
+		ps := sess.touchPath(d.PathID, src, now.UnixNano())
+		ps.Rx.OnData(d.PathSeq, n, int32(e.txTS()-d.TxTS), now)
+		sess.lastSeen.Store(now.UnixNano())
 		e.Stats.RxPackets.Add(1)
 		e.Stats.RxBytes.Add(uint64(n))
 		pkt := buffers.Packet{Slab: slab, Off: d.Len(), Len: len(payload)}
 		sess.reorder.Push(d.GlobalSeq, pkt)
-	case wire.TypeHello:
-		e.handleHello(dgram, h, src)
-		buffers.Put(slab)
-	case wire.TypeBye:
-		if _, m, ok := control.ParseBye(dgram, e.mac); ok && control.FreshTS(m.UnixTS, time.Now()) {
-			e.removeSessionPath(m.Session, h.PathID)
+		return
+	case wire.TypeProbe:
+		if hh, pr, ok := control.ParseProbe(dgram, e.mac); ok {
+			if sess := e.lookupSession(pr.Session); sess != nil {
+				sess.touchPath(hh.PathID, src, now.UnixNano())
+				ack := control.EncodeProbeAck(wire.Header{PathID: hh.PathID},
+					control.ProbeAck{Session: pr.Session, Seq: pr.Seq, TxTS: pr.TxTS}, e.mac)
+				e.server.sock.WriteToUDPAddrPort(ack, src)
+			}
 		}
-		buffers.Put(slab)
-	default:
-		buffers.Put(slab)
+	case wire.TypeProbeAck:
+		if hh, ack, ok := control.ParseProbeAck(dgram, e.mac); ok {
+			if sess := e.lookupSession(ack.Session); sess != nil {
+				if ps := sess.path(hh.PathID); ps != nil {
+					rtt := time.Duration(e.nowUS()-ack.TxTS)*time.Microsecond - time.Duration(ack.HoldUS)*time.Microsecond
+					if ps.Link.OnProbeAck(ack.Seq, rtt) {
+						e.log.Info("path up", "session", sess.ID, "path", hh.PathID, "srtt", rtt)
+					}
+				}
+			}
+		}
+	case wire.TypeCtrl:
+		if _, c, ok := control.ParseCtrl(dgram, e.mac); ok {
+			if sess := e.lookupSession(c.Session); sess != nil {
+				for _, st := range c.Paths {
+					if ps := sess.path(st.PathID); ps != nil {
+						ps.Link.OnCtrl(st.Highest, st.RxPkts, st.RxBytes, now)
+					}
+				}
+			}
+		}
+	case wire.TypeHello:
+		e.handleHello(dgram, src)
+	case wire.TypeBye:
+		if hb, m, ok := control.ParseBye(dgram, e.mac); ok && control.FreshTS(m.UnixTS, now) {
+			e.removeSessionPath(m.Session, hb.PathID)
+		}
 	}
+	buffers.Put(slab)
 }
 
-func (e *Engine) handleHello(dgram []byte, h wire.Header, src netip.AddrPort) {
+func (e *Engine) handleHello(dgram []byte, src netip.AddrPort) {
 	hh, m, ok := control.ParseHello(dgram, e.mac)
 	if !ok || hh.Type != wire.TypeHello || !control.FreshTS(m.UnixTS, time.Now()) {
 		e.Stats.RxDropMalformed.Add(1)
@@ -180,6 +220,7 @@ func (e *Engine) handleHello(dgram []byte, h wire.Header, src netip.AddrPort) {
 			Ep:       ep,
 			paths:    make(map[uint8]*pathState),
 			reorder:  e.newReorder(ep),
+			wsched:   sched.NewWeighted(),
 		}
 		st.sessions[m.Session] = sess
 		e.log.Info("session created", "session", m.Session, "src", src)
@@ -206,6 +247,16 @@ func (e *Engine) lookupSession(id uint32) *Session {
 	s := e.server.sessions[id]
 	e.server.mu.RUnlock()
 	return s
+}
+
+func (e *Engine) allSessions() []*Session {
+	e.server.mu.RLock()
+	defer e.server.mu.RUnlock()
+	out := make([]*Session, 0, len(e.server.sessions))
+	for _, s := range e.server.sessions {
+		out = append(out, s)
+	}
+	return out
 }
 
 func (e *Engine) removeSessionPath(sessionID uint32, pathID uint8) {
@@ -248,35 +299,158 @@ func (e *Engine) sessionReaper() {
 	}
 }
 
+// serverControlLoop probes every alive path of every session (100ms, 500ms
+// while down) and reports the server's receive stats back to each client.
+func (e *Engine) serverControlLoop() {
+	t := time.NewTicker(ctrlBusy) // 50ms base tick
+	defer t.Stop()
+	tick := 0
+	lastRx := make(map[uint32]uint32)
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case <-t.C:
+		}
+		tick++
+		now := time.Now()
+		for _, sess := range e.allSessions() {
+			alive := sess.alivePaths(now.UnixNano())
+			if len(alive) == 0 {
+				continue
+			}
+			if tick%2 == 0 { // probes at 100ms
+				for _, ps := range alive {
+					if !ps.Link.Up() && tick%10 != 0 {
+						continue // 500ms cadence while down
+					}
+					seq, wentDown := ps.Link.OnProbeSent()
+					if wentDown {
+						e.log.Warn("path down", "session", sess.ID, "path", ps.id)
+					}
+					probe := control.EncodeProbe(wire.Header{PathID: ps.id},
+						control.Probe{Session: sess.ID, Seq: seq, TxTS: e.nowUS()}, e.mac)
+					e.server.sock.WriteToUDPAddrPort(probe, ps.addr)
+				}
+			}
+
+			// CTRL: 50ms under traffic, 250ms idle.
+			c := control.Ctrl{Session: sess.ID}
+			for _, ps := range alive {
+				if highest, pkts, bytes, owdMin, owdAvg, ok := ps.Rx.Report(); ok {
+					c.Paths = append(c.Paths, control.PathStats{
+						PathID: ps.id, Highest: highest, RxPkts: pkts, RxBytes: bytes,
+						OwdMinUS: owdMin, OwdAvgUS: owdAvg,
+					})
+				}
+			}
+			if len(c.Paths) == 0 {
+				continue
+			}
+			idleSkip := tick%5 != 0
+			totalPkts := uint32(0)
+			for _, p := range c.Paths {
+				totalPkts += p.RxPkts
+			}
+			if totalPkts == lastRx[sess.ID] && idleSkip {
+				continue
+			}
+			lastRx[sess.ID] = totalPkts
+			best := bestServerCtrlPath(alive)
+			if best == nil {
+				continue
+			}
+			e.server.sock.WriteToUDPAddrPort(
+				control.EncodeCtrl(wire.Header{PathID: best.id}, c, e.mac), best.addr)
+
+			// Retune this session's reorder hold once a second.
+			if tick%20 == 0 {
+				views := make([][2]float64, 0, len(alive))
+				for _, ps := range alive {
+					if ew, j, ok := ps.Rx.OwdView(now, 3*time.Second); ok {
+						views = append(views, [2]float64{ew, j})
+					}
+				}
+				if hold := pathmon.ComputeHold(views); hold > 0 {
+					sess.reorder.SetHold(hold)
+				}
+			}
+		}
+	}
+}
+
+func bestServerCtrlPath(alive []*pathState) *pathState {
+	var best *pathState
+	var bestSRTT time.Duration
+	for _, ps := range alive {
+		s := ps.Link.Snapshot()
+		if !s.Up {
+			continue
+		}
+		if best == nil || (s.SRTT > 0 && s.SRTT < bestSRTT) {
+			best, bestSRTT = ps, s.SRTT
+		}
+	}
+	if best != nil {
+		return best
+	}
+	var newest *pathState
+	for _, ps := range alive {
+		if newest == nil || ps.lastRx > newest.lastRx {
+			newest = ps
+		}
+	}
+	return newest
+}
+
 // serverSend is the wgbridge SendFunc of the server: return ciphertext is
-// striped round-robin across the client's recently active paths (the
-// adaptive weighted scheduler replaces plain round-robin in milestone M3).
+// scheduled per packet across the client's alive paths.
 func (e *Engine) serverSend(bufs [][]byte, ep *wgbridge.SessionEndpoint) error {
 	sess := e.lookupSession(ep.Session)
 	if sess == nil {
 		e.Stats.TxDropNoPath.Add(uint64(len(bufs)))
 		return nil
 	}
-	ids, addrs := sess.alivePaths(time.Now().UnixNano())
-	if len(ids) == 0 {
-		e.Stats.TxDropNoPath.Add(uint64(len(bufs)))
-		return nil
-	}
 	for _, ct := range bufs {
-		i := int(sess.rr.Add(1)) % len(ids)
-		e.serverSendData(sess, ids[i], addrs[i], ct)
+		alive := sess.alivePaths(time.Now().UnixNano())
+		usable := alive[:0:0]
+		for _, ps := range alive {
+			if ps.Link.Up() {
+				usable = append(usable, ps)
+			}
+		}
+		if len(usable) == 0 {
+			usable = alive // bootstrap: probes not confirmed yet
+		}
+		if len(usable) == 0 {
+			e.Stats.TxDropNoPath.Add(1)
+			continue
+		}
+		var ps *pathState
+		if len(usable) == 1 {
+			ps = usable[0]
+		} else {
+			ids := make([]uint8, len(usable))
+			weights := make([]float64, len(usable))
+			for i, u := range usable {
+				ids[i] = u.id
+				weights[i] = u.Link.Weight()
+			}
+			ps = usable[sess.wsched.Pick(ids, weights)]
+		}
+		e.serverSendData(sess, ps, ct)
 	}
 	return nil
 }
 
-func (e *Engine) serverSendData(sess *Session, pathID uint8, addr netip.AddrPort, ct []byte) {
+func (e *Engine) serverSendData(sess *Session, ps *pathState, ct []byte) {
 	slab := buffers.Get()
 	defer buffers.Put(slab)
 	d := wire.DataHeader{
-		Header:    wire.Header{Type: wire.TypeData, PathID: pathID},
+		Header:    wire.Header{Type: wire.TypeData, PathID: ps.id},
 		Session:   sess.ID,
 		GlobalSeq: sess.globalSeq.Add(1),
-		PathSeq:   sess.pathSeq[pathID].Add(1),
+		PathSeq:   sess.pathSeq[ps.id].Add(1),
 		TxTS:      e.txTS(),
 	}
 	n := wire.PutDataHeader(*slab, &d)
@@ -284,7 +458,7 @@ func (e *Engine) serverSendData(sess *Session, pathID uint8, addr netip.AddrPort
 		return
 	}
 	m := copy((*slab)[n:], ct)
-	if _, err := e.server.sock.WriteToUDPAddrPort((*slab)[:n+m], addr); err == nil {
+	if _, err := e.server.sock.WriteToUDPAddrPort((*slab)[:n+m], ps.addr); err == nil {
 		e.Stats.TxPackets.Add(1)
 		e.Stats.TxBytes.Add(uint64(n + m))
 	}

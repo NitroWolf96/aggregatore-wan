@@ -53,10 +53,10 @@ paths:
     bind: 10.11.1.2
 EOF
 
-ip netns exec tr-cloud "$BIN/treccia-server" -config "$WORK/server.yaml" ${VERBOSE:+-verbose} &
+ip netns exec tr-cloud "$BIN/treccia-server" -config "$WORK/server.yaml" ${VERBOSE:+-verbose} > /tmp/treccia-test-server.log 2>&1 &
 SERVER_PID=$!
 sleep 0.5
-ip netns exec tr-router "$BIN/treccia-client" -config "$WORK/client.yaml" ${VERBOSE:+-verbose} &
+ip netns exec tr-router "$BIN/treccia-client" -config "$WORK/client.yaml" ${VERBOSE:+-verbose} > /tmp/treccia-test-client.log 2>&1 &
 CLIENT_PID=$!
 sleep 1.5
 

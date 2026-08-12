@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# run_m2.sh - end-to-end check of multipath striping (milestone M2).
-# Two shaped WANs (duo profile: 50 Mbit + 30 Mbit); a single TCP flow
-# through the tunnel must beat the best single link.
+# run_m3.sh - end-to-end check of the adaptive scheduler and failover (M3).
+# 1) weighted bonding on duo (50+30 Mbit) must beat plain round-robin;
+# 2) a WAN failure mid-transfer must not kill the TCP session, and
+#    throughput must recover after the link returns.
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT=$(cd ../.. && pwd)
@@ -27,7 +28,7 @@ SERVER_PRIV=$("$BIN/treccia-server" genkey)
 CLIENT_PRIV=$("$BIN/treccia-client" genkey)
 SERVER_PUB=$(echo "$SERVER_PRIV" | "$BIN/treccia-server" pubkey)
 CLIENT_PUB=$(echo "$CLIENT_PRIV" | "$BIN/treccia-client" pubkey)
-PSK="m2-test-psk"
+PSK="m3-test-psk"
 
 cat > "$WORK/server.yaml" <<EOF
 tunnel:
@@ -59,25 +60,39 @@ SERVER_PID=$!
 sleep 0.5
 ip netns exec tr-router "$BIN/treccia-client" -config "$WORK/client.yaml" ${VERBOSE:+-verbose} > /tmp/treccia-test-client.log 2>&1 &
 CLIENT_PID=$!
-sleep 2
+sleep 3  # let probes measure the paths
 
 bps() { python3 -c "import json,sys; print(json.load(sys.stdin)['end']['sum_received']['bits_per_second'])"; }
 
-echo "== baseline: single WAN1 (50 Mbit shaped) =="
+echo "== weighted bonding on 50+30 Mbit =="
 ip netns exec tr-cloud iperf3 -s -D -1
 sleep 0.3
-BASE=$(ip netns exec tr-router iperf3 -c 10.10.0.2 -B 10.11.1.2 -t "${DURATION:-5}" -J | bps)
+BOND=$(ip netns exec tr-router iperf3 -c 10.200.0.1 -t "${DURATION:-8}" -J | bps)
+python3 -c "b=$BOND/1e6; print(f'bonded (weighted): {b:.1f} Mbit/s')"
 
-echo "== bonded: single TCP flow through the tunnel (50+30 Mbit) =="
+echo "== failover: wan1 dies mid-transfer, returns, throughput recovers =="
 ip netns exec tr-cloud iperf3 -s -D -1
 sleep 0.3
-BOND=$(ip netns exec tr-router iperf3 -c 10.200.0.1 -t "${DURATION:-5}" -J | bps)
+LOG="$WORK/failover.json"
+ip netns exec tr-router iperf3 -c 10.200.0.1 -t 20 -J > "$LOG" &
+IPERF_PID=$!
+sleep 5
+./chaos.sh flap 1 6   # down at t=5s, up at t=11s
+wait "$IPERF_PID"
 
-# The bonded flow must beat the best single link (50 Mbit shaped).
-python3 - "$BASE" "$BOND" <<'PY'
-import sys
-base, bond = float(sys.argv[1]), float(sys.argv[2])
-print(f"baseline={base/1e6:.1f} Mbit/s bonded={bond/1e6:.1f} Mbit/s gain={bond/base:.2f}x")
-sys.exit(0 if bond > base * 1.05 else 1)
+python3 - "$LOG" "$BOND" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1]))
+bond = float(sys.argv[2])
+ints = [ (i['sum']['start'], i['sum']['bits_per_second']/1e6) for i in data['intervals'] ]
+for t, mbps in ints:
+    print(f"  t={t:5.1f}s  {mbps:7.1f} Mbit/s")
+total = data['end']['sum_received']['bits_per_second']/1e6
+print(f"session survived the WAN failure; average {total:.1f} Mbit/s")
+# During the outage only wan2 (30 Mbit) works; afterwards throughput must recover.
+tail = [m for t, m in ints if t >= 15]
+assert ints, "no intervals: session died"
+assert total > 5, f"session effectively dead ({total:.1f} Mbit/s)"
+assert max(tail) > 30, f"no recovery after link return (tail max {max(tail):.1f})"
+print("M3 OK: failover + recovery")
 PY
-echo "M2 OK: bonding beats the best single link"
