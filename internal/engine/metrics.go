@@ -19,6 +19,8 @@ type PathMetrics struct {
 	LossPct      float64 `json:"loss_pct"`
 	CapacityMbps float64 `json:"capacity_mbps"`
 	WeightMbps   float64 `json:"weight_mbps"`
+	DelayFactor  float64 `json:"delay_factor"`
+	QueueMs      float64 `json:"queue_ms"`
 	OwdAvgMs     float64 `json:"owd_avg_ms"`
 	OwdJitterMs  float64 `json:"owd_jitter_ms"`
 	TxPackets    uint32  `json:"tx_packets"`
@@ -123,6 +125,8 @@ func pathMetrics(s pathmon.Snapshot, rx *pathmon.RxStats, now time.Time) PathMet
 		LossPct:      s.LossEWMA * 100,
 		CapacityMbps: s.CapacityBps / 1e6,
 		WeightMbps:   s.WeightBps / 1e6,
+		DelayFactor:  s.DelayFactor,
+		QueueMs:      s.QueueMs,
 	}
 	if ew, j, ok := rx.OwdView(now, 3*time.Second); ok {
 		pm.OwdAvgMs = ew / 1000

@@ -55,6 +55,8 @@ tunnel:
   peer_public_key: $CLIENT_PUB
 listen: ":51820"
 control_psk: "$PSK"
+dashboard:
+  listen: 127.0.0.1:8081
 EOF
 
 cat > "$WORK/client.yaml" <<EOF
@@ -70,7 +72,32 @@ paths:
     bind: 10.11.1.2
   - name: wan2
     bind: 10.11.2.2
+dashboard:
+  listen: 127.0.0.1:8080
 EOF
+
+# telemetry NS PORT LABEL: one compact line per second from the dashboard.
+telemetry() {
+    local ns=$1 port=$2 label=$3
+    while true; do
+        ip netns exec "$ns" curl -s "http://127.0.0.1:$port/api/metrics" | python3 -c "
+import json, sys
+try:
+    m = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+paths = m.get('paths') or (m.get('sessions') or [{}])[0].get('paths', [])
+r = m.get('reorder') or (m.get('sessions') or [{}])[0].get('reorder', {})
+f = m.get('fec') or (m.get('sessions') or [{}])[0].get('fec')
+ps = ' '.join(
+    f\"p{p.get('id')}[up={int(p.get('up', False))} w={p.get('weight_mbps', 0):.1f}M cap={p.get('capacity_mbps', 0):.1f}M q={p.get('queue_ms', 0):.0f}ms loss={p.get('loss_pct', 0):.1f}% owd={p.get('owd_avg_ms', 0):.0f}ms]\"
+    for p in paths)
+fec = f\" fec={f['params']}/rec{f['recovered']}\" if f else ''
+print(f\"[$label] {ps} reorder[del={r.get('Delivered',0)} late={r.get('Late',0)} to={r.get('TimedOut',0)} depth={r.get('Depth',0)}]{fec}\", flush=True)
+" 2>/dev/null || true
+        sleep 1
+    done
+}
 
 ip netns exec tr-cloud "$BIN/treccia-server" -config "$WORK/server.yaml" ${VERBOSE:+-verbose} > /tmp/treccia-test-server.log 2>&1 &
 SERVER_PID=$!
@@ -87,7 +114,12 @@ BASE=$(ip netns exec tr-router iperf3 -c 10.10.0.2 -B 10.11.1.2 -t "${DURATION:-
 
 echo "== bonded: single TCP flow through the tunnel (50+30 Mbit) =="
 iperf_srv
-BOND=$(ip netns exec tr-router iperf3 -c 10.200.0.1 -t "${DURATION:-5}" -J | bps)
+telemetry tr-router 8080 client &
+TEL1=$!
+telemetry tr-cloud 8081 server &
+TEL2=$!
+BOND=$(ip netns exec tr-router iperf3 -c 10.200.0.1 -t "${DURATION:-8}" -J | bps)
+kill $TEL1 $TEL2 2>/dev/null || true
 
 # The bonded flow must beat the best single link (50 Mbit shaped).
 python3 - "$BASE" "$BOND" <<'PY'
