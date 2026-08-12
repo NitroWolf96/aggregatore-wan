@@ -229,7 +229,7 @@ func (e *Engine) handleServerDatagram(slab *[]byte, n int, src netip.AddrPort) {
 			if sess := e.lookupSession(c.Session); sess != nil {
 				for _, st := range c.Paths {
 					if ps := sess.path(st.PathID); ps != nil {
-						ps.Link.OnCtrl(st.Highest, st.RxPkts, st.RxBytes, now)
+						ps.Link.OnCtrl(st.Highest, st.RxPkts, st.RxBytes, int32(st.OwdMinUS), int32(st.OwdAvgUS), now)
 					}
 				}
 			}

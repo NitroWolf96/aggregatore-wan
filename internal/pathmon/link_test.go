@@ -100,11 +100,11 @@ func TestCapacityAndLossDiscount(t *testing.T) {
 	ackN(l, probeAckUp, 20*time.Millisecond)
 
 	now := time.Unix(0, 0)
-	l.OnCtrl(0, 0, 0, now) // baseline
+	l.OnCtrl(0, 0, 0, 0, 0, now) // baseline
 	// Clean 50ms intervals delivering 350 kB each: ~56 Mbit/s.
 	for i := 1; i <= 5; i++ {
 		now = now.Add(50 * time.Millisecond)
-		l.OnCtrl(uint32(250*i), uint32(250*i), uint64(350000*i), now)
+		l.OnCtrl(uint32(250*i), uint32(250*i), uint64(350000*i), 0, 0, now)
 	}
 	s := l.Snapshot()
 	if s.CapacityBps < 50e6 || s.CapacityBps > 65e6 {
@@ -116,7 +116,7 @@ func TestCapacityAndLossDiscount(t *testing.T) {
 
 	// Lossy interval: 250 expected, 200 received -> weight cut.
 	now = now.Add(50 * time.Millisecond)
-	l.OnCtrl(250*6, 250*5+200, 350000*6, now)
+	l.OnCtrl(250*6, 250*5+200, 350000*6, 0, 0, now)
 	s2 := l.Snapshot()
 	if s2.LossEWMA <= 0 {
 		t.Fatalf("lossEWMA = %v", s2.LossEWMA)
@@ -128,10 +128,47 @@ func TestCapacityAndLossDiscount(t *testing.T) {
 	// Clean intervals recover the discount.
 	for i := 7; i < 30; i++ {
 		now = now.Add(50 * time.Millisecond)
-		l.OnCtrl(uint32(250*i), uint32(250*(i-1)+200), uint64(350000*i), now)
+		l.OnCtrl(uint32(250*i), uint32(250*(i-1)+200), uint64(350000*i), 0, 0, now)
 	}
 	if f := l.Snapshot().LossFactor; f < 0.5 {
 		t.Fatalf("loss factor did not recover: %v", f)
+	}
+}
+
+// TestDelayDiscount: a standing queue at the receiver (avg OWD far above
+// the baseline min) must cut the path's weight; draining recovers it.
+func TestDelayDiscount(t *testing.T) {
+	l := NewLink()
+	ackN(l, probeAckUp, 20*time.Millisecond)
+	now := time.Unix(0, 0)
+	// Baseline: no queue, avg == min.
+	l.OnCtrl(0, 0, 0, 5000, 5200, now)
+	for i := 1; i <= 3; i++ {
+		now = now.Add(50 * time.Millisecond)
+		l.OnCtrl(uint32(100*i), uint32(100*i), uint64(140000*i), 5000, 5200, now)
+	}
+	if f := l.Snapshot().DelayFactor; f < 0.9 {
+		t.Fatalf("clean path discounted: %v", f)
+	}
+	// Bufferbloat: avg OWD 150ms above the 5ms baseline.
+	for i := 4; i <= 10; i++ {
+		now = now.Add(50 * time.Millisecond)
+		l.OnCtrl(uint32(100*i), uint32(100*i), uint64(140000*i), 6000, 155000, now)
+	}
+	bloated := l.Snapshot()
+	if bloated.DelayFactor > 0.5 {
+		t.Fatalf("bloated path not discounted: %+v", bloated)
+	}
+	if bloated.QueueMs < 100 {
+		t.Fatalf("queue estimate %vms", bloated.QueueMs)
+	}
+	// Queue drains: factor recovers.
+	for i := 11; i <= 60; i++ {
+		now = now.Add(50 * time.Millisecond)
+		l.OnCtrl(uint32(100*i), uint32(100*i), uint64(140000*i), 5000, 5500, now)
+	}
+	if f := l.Snapshot().DelayFactor; f < 0.8 {
+		t.Fatalf("factor did not recover: %v", f)
 	}
 }
 

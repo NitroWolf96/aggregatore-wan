@@ -494,7 +494,7 @@ func (e *Engine) onClientCtrl(c control.Ctrl, now time.Time) {
 	paths := e.allPaths()
 	for _, ps := range c.Paths {
 		if int(ps.PathID) < len(paths) {
-			paths[ps.PathID].Link.OnCtrl(ps.Highest, ps.RxPkts, ps.RxBytes, now)
+			paths[ps.PathID].Link.OnCtrl(ps.Highest, ps.RxPkts, ps.RxBytes, int32(ps.OwdMinUS), int32(ps.OwdAvgUS), now)
 		}
 	}
 }

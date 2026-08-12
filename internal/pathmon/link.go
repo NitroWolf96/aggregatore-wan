@@ -28,6 +28,19 @@ const (
 	minLossFactor = 0.05
 )
 
+// Delay discount (LEDBAT-style): when a path's standing queue — its
+// average one-way delay above the rolling baseline minimum — exceeds the
+// target, its weight is cut so the queue drains. Keeping queues short
+// keeps the inter-path delay spread inside the reorder hold budget and
+// avoids self-induced loss.
+const (
+	targetQueueUS  = 30_000 // 30ms standing queue target
+	delayCut       = 0.85
+	delayRecover   = 0.05
+	minDelayFactor = 0.1
+	baselineWindow = 30 * time.Second
+)
+
 type capSample struct {
 	t   time.Time
 	bps float64
@@ -41,7 +54,9 @@ type Snapshot struct {
 	LossEWMA    float64
 	CapacityBps float64
 	LossFactor  float64
-	WeightBps   float64 // capacity discounted by loss; 0 = unknown
+	DelayFactor float64
+	QueueMs     float64 // standing queue estimate at the far receiver
+	WeightBps   float64 // capacity discounted by loss and queueing; 0 = unknown
 }
 
 // Link tracks one path of one sending direction.
@@ -54,12 +69,20 @@ type Link struct {
 	hasRTT       bool
 	lossEWMA     float64
 	lossFactor   float64
+	delayFactor  float64
+	queueUS      float64
 	capSamples   []capSample
 	lastHighest  uint32
 	haveCtrl     bool
 	lastRxPkts   uint32
 	lastRxBytes  uint64
 	lastCtrlTime time.Time
+
+	// Rolling two-bucket minimum of the receiver-reported one-way delay:
+	// the propagation baseline against which queueing is measured.
+	owdBase     [2]int32
+	owdBaseSet  [2]bool
+	owdBucketAt time.Time
 
 	consecAcked  int
 	lastProbeSeq uint32
@@ -73,7 +96,7 @@ type probeSent struct {
 
 // NewLink starts in the DOWN state; the first probe acks bring it up.
 func NewLink() *Link {
-	return &Link{lossFactor: 1}
+	return &Link{lossFactor: 1, delayFactor: 1}
 }
 
 // probeRTO is how long an unanswered probe may age before it means the
@@ -170,10 +193,15 @@ func (l *Link) goDownLocked() {
 }
 
 // OnCtrl ingests the receiver's PathStats for this path: loss over the
-// report interval, delivery-rate capacity samples, and the loss discount.
-func (l *Link) OnCtrl(highest, rxPkts uint32, rxBytes uint64, now time.Time) {
+// report interval, delivery-rate capacity samples, and the loss and
+// queueing-delay discounts. owdMinUS/owdAvgUS are the receiver's relative
+// one-way-delay stats for the window (clock offset cancels against the
+// rolling baseline).
+func (l *Link) OnCtrl(highest, rxPkts uint32, rxBytes uint64, owdMinUS, owdAvgUS int32, now time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	l.updateDelayLocked(owdMinUS, owdAvgUS, now)
 
 	if !l.haveCtrl {
 		l.haveCtrl = true
@@ -231,6 +259,40 @@ func (l *Link) OnCtrl(highest, rxPkts uint32, rxBytes uint64, now time.Time) {
 	}
 }
 
+// updateDelayLocked maintains the propagation baseline (two-bucket rolling
+// minimum of the reported window-min OWD) and the queueing-delay discount.
+func (l *Link) updateDelayLocked(owdMinUS, owdAvgUS int32, now time.Time) {
+	if l.owdBucketAt.IsZero() {
+		l.owdBucketAt = now
+	}
+	if now.Sub(l.owdBucketAt) > baselineWindow/2 {
+		l.owdBase[0], l.owdBaseSet[0] = l.owdBase[1], l.owdBaseSet[1]
+		l.owdBaseSet[1] = false
+		l.owdBucketAt = now
+	}
+	if !l.owdBaseSet[1] || owdMinUS-l.owdBase[1] < 0 {
+		l.owdBase[1], l.owdBaseSet[1] = owdMinUS, true
+	}
+	base := l.owdBase[1]
+	if l.owdBaseSet[0] && l.owdBase[0]-base < 0 {
+		base = l.owdBase[0]
+	}
+
+	q := float64(owdAvgUS - base)
+	if q < 0 {
+		q = 0
+	}
+	l.queueUS = q
+	if q > 2*targetQueueUS {
+		l.delayFactor *= delayCut
+		if l.delayFactor < minDelayFactor {
+			l.delayFactor = minDelayFactor
+		}
+	} else if q < targetQueueUS {
+		l.delayFactor += delayRecover * (1 - l.delayFactor)
+	}
+}
+
 func (l *Link) capacityBpsLocked() float64 {
 	max := 0.0
 	for _, s := range l.capSamples {
@@ -253,7 +315,9 @@ func (l *Link) Snapshot() Snapshot {
 		LossEWMA:    l.lossEWMA,
 		CapacityBps: capBps,
 		LossFactor:  l.lossFactor,
-		WeightBps:   capBps * l.lossFactor,
+		DelayFactor: l.delayFactor,
+		QueueMs:     l.queueUS / 1000,
+		WeightBps:   capBps * l.lossFactor * l.delayFactor,
 	}
 }
 
@@ -261,7 +325,7 @@ func (l *Link) Snapshot() Snapshot {
 func (l *Link) Weight() float64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.capacityBpsLocked() * l.lossFactor
+	return l.capacityBpsLocked() * l.lossFactor * l.delayFactor
 }
 
 // Up reports the path state.
