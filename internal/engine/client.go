@@ -3,6 +3,7 @@ package engine
 import (
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -277,6 +278,12 @@ func (e *Engine) clientSend(bufs [][]byte, _ *wgbridge.SessionEndpoint) error {
 				weights[i] = pp.Link.Weight()
 			}
 			p = paths[e.wsched.Pick(ids, weights)]
+		}
+		// Ingress AQM: an early drop before sequencing tells the inner
+		// congestion control to slow down while queues are still short.
+		if prob := p.Link.DropProb(); prob > 0 && rand.Float64() < prob {
+			e.Stats.AQMDrops.Add(1)
+			continue
 		}
 		seq := e.globalSeq.Add(1)
 		var tag fecTag

@@ -38,6 +38,7 @@ const (
 	delayCut       = 0.85
 	delayRecover   = 0.05
 	minDelayFactor = 0.1
+	maxAQMProb     = 0.15
 	baselineWindow = 30 * time.Second
 )
 
@@ -71,6 +72,7 @@ type Link struct {
 	lossFactor   float64
 	delayFactor  float64
 	queueUS      float64
+	aqmProb      float64
 	capSamples   []capSample
 	lastHighest  uint32
 	haveCtrl     bool
@@ -300,6 +302,20 @@ func (l *Link) updateDelayLocked(owdMinUS, owdAvgUS int32, now time.Time) {
 	} else if q < targetQueueUS {
 		l.delayFactor += delayRecover * (1 - l.delayFactor)
 	}
+
+	// Ingress AQM: reweighting alone cannot relieve pressure — the inner
+	// loss-based TCP fills whatever bottleneck queue its packets land in.
+	// Turning a standing queue into a small early-drop probability gives
+	// the inner congestion control its signal while queues are still
+	// short, instead of after a multi-hundred-ms overflow burst.
+	if excess := q - 2*targetQueueUS; excess > 0 {
+		l.aqmProb = excess / (8 * targetQueueUS)
+		if l.aqmProb > maxAQMProb {
+			l.aqmProb = maxAQMProb
+		}
+	} else {
+		l.aqmProb = 0
+	}
 }
 
 func (l *Link) capacityBpsLocked() float64 {
@@ -335,6 +351,14 @@ func (l *Link) Weight() float64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.capacityBpsLocked() * l.lossFactor * l.delayFactor
+}
+
+// DropProb returns the current ingress-AQM early-drop probability for
+// bulk packets assigned to this path.
+func (l *Link) DropProb() float64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.aqmProb
 }
 
 // Up reports the path state.

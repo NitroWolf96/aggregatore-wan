@@ -3,6 +3,7 @@ package engine
 import (
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"net/netip"
 	"sync"
@@ -520,6 +521,11 @@ func (e *Engine) serverSend(bufs [][]byte, ep *wgbridge.SessionEndpoint) error {
 				weights[i] = u.Link.Weight()
 			}
 			ps = usable[sess.wsched.Pick(ids, weights)]
+		}
+		// Ingress AQM, as on the client: early-drop before sequencing.
+		if prob := ps.Link.DropProb(); prob > 0 && rand.Float64() < prob {
+			e.Stats.AQMDrops.Add(1)
+			continue
 		}
 		seq := sess.globalSeq.Add(1)
 		var tag fecTag

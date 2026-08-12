@@ -32,8 +32,9 @@ type Tunnel struct {
 
 // Path is one WAN uplink of the client.
 type Path struct {
-	Name string `yaml:"name"`
-	Bind string `yaml:"bind"` // local source IP on that WAN
+	Name   string `yaml:"name"`
+	Bind   string `yaml:"bind"`   // local source IP on that WAN
+	Server string `yaml:"server"` // per-path server address override
 }
 
 // Dashboard configures the embedded metrics endpoint.

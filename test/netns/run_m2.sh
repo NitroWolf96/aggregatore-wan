@@ -113,12 +113,14 @@ iperf_srv
 BASE=$(ip netns exec tr-router iperf3 -c 10.10.0.2 -B 10.11.1.2 -t "${DURATION:-5}" -J | bps)
 
 echo "== bonded: single TCP flow through the tunnel (50+30 Mbit) =="
+# -O 4 omits TCP slow start: the assertion measures sustained bonding,
+# not the one-time ramp transient.
 iperf_srv
 telemetry tr-router 8080 client &
 TEL1=$!
 telemetry tr-cloud 8081 server &
 TEL2=$!
-BOND=$(ip netns exec tr-router iperf3 -c 10.200.0.1 -t "${DURATION:-8}" -J | bps)
+BOND=$(ip netns exec tr-router iperf3 -c 10.200.0.1 -O 4 -t "${DURATION:-12}" -J | bps)
 kill $TEL1 $TEL2 2>/dev/null || true
 
 # The bonded flow must beat the best single link (50 Mbit shaped).

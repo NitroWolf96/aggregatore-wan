@@ -47,6 +47,7 @@ type Counters struct {
 	RxDropUnknown   atomic.Uint64 // datagrams for unknown sessions/paths
 	RxDropQueue     atomic.Uint64 // WireGuard receive queue full
 	RxDropMalformed atomic.Uint64
+	AQMDrops        atomic.Uint64 // bulk packets early-dropped by ingress AQM
 }
 
 // Config parametrizes a new engine.

@@ -83,7 +83,11 @@ func main() {
 	defer wg.Close()
 
 	for _, p := range cfg.Paths {
-		if _, err := eng.AddPath(p.Name, p.Bind, cfg.ServerAddr); err != nil {
+		server := p.Server
+		if server == "" {
+			server = cfg.ServerAddr
+		}
+		if _, err := eng.AddPath(p.Name, p.Bind, server); err != nil {
 			log.Error("path", "name", p.Name, "err", err)
 			os.Exit(1)
 		}
