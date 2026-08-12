@@ -59,12 +59,12 @@ jobs:
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y iperf3 iproute2
       - name: M1 single-path tunnel
-        run: sudo test/netns/run_m1.sh
+        run: sudo env "PATH=$PATH" test/netns/run_m1.sh
       - name: M2 striping
-        run: sudo test/netns/run_m2.sh
+        run: sudo env "PATH=$PATH" test/netns/run_m2.sh
       - name: M3 failover + recovery
-        run: sudo test/netns/run_m3.sh
+        run: sudo env "PATH=$PATH" test/netns/run_m3.sh
       - name: M4 realtime duplication
-        run: sudo test/netns/run_m4.sh
+        run: sudo env "PATH=$PATH" test/netns/run_m4.sh
       - name: M5 FEC
-        run: sudo test/netns/run_m5.sh
+        run: sudo env "PATH=$PATH" test/netns/run_m5.sh
