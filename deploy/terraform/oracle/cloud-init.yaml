@@ -1,0 +1,73 @@
+#cloud-config
+# Builds treccia-server from source (no registry dependency), generates the
+# server keys, configures NAT and installs a systemd unit.
+package_update: true
+packages:
+  - git
+  - make
+  - iptables-persistent
+
+write_files:
+  - path: /etc/systemd/system/treccia-server.service
+    content: |
+      [Unit]
+      Description=Treccia aggregation server
+      After=network-online.target
+      Wants=network-online.target
+      [Service]
+      ExecStart=/usr/local/bin/treccia-server -config /etc/treccia/server.yaml
+      Restart=always
+      RestartSec=2
+      LimitNOFILE=65536
+      [Install]
+      WantedBy=multi-user.target
+  - path: /usr/local/share/treccia-setup.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      export PATH=$PATH:/usr/local/go/bin
+
+      ARCH=$(dpkg --print-architecture)   # arm64 on A1
+      GO_VER=1.25.0
+      curl -fsSL "https://go.dev/dl/go$${GO_VER}.linux-$${ARCH}.tar.gz" | tar -C /usr/local -xz
+
+      git clone --depth 1 https://github.com/nitrowolf96/aggregatore-wan /opt/treccia-src
+      cd /opt/treccia-src
+      make build
+      install -m 0755 bin/treccia-server bin/treccia-client /usr/local/bin/
+
+      mkdir -p /etc/treccia
+      umask 077
+      treccia-server genkey > /etc/treccia/server.key
+      treccia-server pubkey < /etc/treccia/server.key > /etc/treccia/server.pub
+      chmod 0644 /etc/treccia/server.pub
+
+      cat > /etc/treccia/server.yaml <<EOF
+      tunnel:
+        interface: treccia0
+        address: 10.200.0.1/24
+        private_key: "$(cat /etc/treccia/server.key)"
+        peer_public_key: "${client_public_key}"
+      listen: ":${tunnel_port}"
+      control_psk: "${control_psk}"
+      dashboard:
+        listen: 0.0.0.0:8080
+        token: "${control_psk}"
+      EOF
+
+      # Forwarding + NAT of the tunnel subnet.
+      sysctl -w net.ipv4.ip_forward=1
+      echo net.ipv4.ip_forward=1 > /etc/sysctl.d/99-treccia.conf
+      OUT_IF=$(ip route show default | awk '/default/ {print $5; exit}')
+      iptables -t nat -A POSTROUTING -s 10.200.0.0/24 -o "$OUT_IF" -j MASQUERADE
+      # Oracle images ship a restrictive INPUT chain: allow the tunnel port.
+      iptables -I INPUT -p udp --dport ${tunnel_port} -j ACCEPT
+      iptables -I INPUT -p tcp --dport 8080 -j ACCEPT
+      netfilter-persistent save
+
+      systemctl daemon-reload
+      systemctl enable --now treccia-server
+
+runcmd:
+  - [/usr/local/share/treccia-setup.sh]
