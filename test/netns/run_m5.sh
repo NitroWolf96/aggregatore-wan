@@ -12,11 +12,16 @@ WORK=$(mktemp -d)
 CLIENT_PID=""
 SERVER_PID=""
 cleanup() {
+    status=$?
     [ -n "$CLIENT_PID" ] && kill "$CLIENT_PID" 2>/dev/null || true
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
     sleep 0.3
     ./topo.sh down >/dev/null 2>&1 || true
     rm -rf "$WORK"
+    if [ "$status" -ne 0 ]; then
+        echo "--- server log (tail) ---"; tail -n 15 /tmp/treccia-test-server.log 2>/dev/null || true
+        echo "--- client log (tail) ---"; tail -n 15 /tmp/treccia-test-client.log 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
 
