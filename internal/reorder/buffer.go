@@ -14,9 +14,12 @@ import (
 // spread.
 const Size = 8192
 
-// DefaultHold is the initial gap timeout; the link estimator retunes it at
-// runtime from the measured inter-path one-way delay spread.
-const DefaultHold = 30 * time.Millisecond
+// DefaultHold is the initial gap timeout, generous enough to cover a
+// typical fiber-vs-LTE delay spread before the first measurement lands;
+// the link estimator retunes it within 250ms of traffic flowing. Starting
+// too low causes early out-of-order passthroughs that scare the inner
+// TCP out of slow start.
+const DefaultHold = 75 * time.Millisecond
 
 // resetThreshold is how many consecutive far-out-of-window packets trigger
 // a buffer reset (peer restarted and its sequence numbers started over).

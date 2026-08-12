@@ -120,7 +120,7 @@ telemetry tr-router 8080 client &
 TEL1=$!
 telemetry tr-cloud 8081 server &
 TEL2=$!
-BOND=$(ip netns exec tr-router iperf3 -c 10.200.0.1 -O 4 -t "${DURATION:-12}" -J | bps)
+BOND=$(ip netns exec tr-router iperf3 -c 10.200.0.1 -O 6 -t "${DURATION:-16}" -J | bps)
 kill $TEL1 $TEL2 2>/dev/null || true
 
 # The bonded flow must beat the best single link (50 Mbit shaped).
