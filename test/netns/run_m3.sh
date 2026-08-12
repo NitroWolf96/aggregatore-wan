@@ -27,6 +27,19 @@ trap cleanup EXIT
 make -C "$ROOT" build >/dev/null
 BIN=$ROOT/bin
 
+iperf_srv() {
+    ip netns exec tr-cloud pkill -x iperf3 2>/dev/null || true
+    sleep 0.2
+    ip netns exec tr-cloud iperf3 -s -D
+    for _ in $(seq 1 25); do
+        ip netns exec tr-cloud ss -ltn 2>/dev/null | grep -q 5201 && { sleep 0.2; return 0; }
+        sleep 0.2
+    done
+    echo "iperf3 server failed to start" >&2
+    return 1
+}
+
+
 ./topo.sh up duo
 
 SERVER_PRIV=$("$BIN/treccia-server" genkey)
@@ -70,14 +83,12 @@ sleep 3  # let probes measure the paths
 bps() { python3 -c "import json,sys; print(json.load(sys.stdin)['end']['sum_received']['bits_per_second'])"; }
 
 echo "== weighted bonding on 50+30 Mbit =="
-ip netns exec tr-cloud iperf3 -s -D -1
-sleep 0.3
+iperf_srv
 BOND=$(ip netns exec tr-router iperf3 -c 10.200.0.1 -t "${DURATION:-8}" -J | bps)
 python3 -c "b=$BOND/1e6; print(f'bonded (weighted): {b:.1f} Mbit/s')"
 
 echo "== failover: wan1 dies mid-transfer, returns, throughput recovers =="
-ip netns exec tr-cloud iperf3 -s -D -1
-sleep 0.3
+iperf_srv
 LOG="$WORK/failover.json"
 ip netns exec tr-router iperf3 -c 10.200.0.1 -t 20 -J > "$LOG" &
 IPERF_PID=$!

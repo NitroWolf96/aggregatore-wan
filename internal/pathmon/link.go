@@ -61,10 +61,14 @@ type Link struct {
 	lastRxBytes  uint64
 	lastCtrlTime time.Time
 
-	consecMissed     int
-	consecAcked      int
-	lastProbeSeq     uint32
-	probeOutstanding bool
+	consecAcked  int
+	lastProbeSeq uint32
+	outstanding  []probeSent // probes sent and not yet acked, oldest first
+}
+
+type probeSent struct {
+	seq uint32
+	at  time.Time
 }
 
 // NewLink starts in the DOWN state; the first probe acks bring it up.
@@ -72,36 +76,58 @@ func NewLink() *Link {
 	return &Link{lossFactor: 1}
 }
 
-// OnProbeSent records that a probe left; if the previous one is still
-// unanswered it counts as a miss, and enough misses take the path down.
-// It returns the probe sequence to embed and whether the path just went
-// down.
-func (l *Link) OnProbeSent() (seq uint32, wentDown bool) {
+// probeRTO is how long an unanswered probe may age before it means the
+// path is dead. RTT-adaptive so queueing delay (bufferbloat under load)
+// never masquerades as loss, floored well above the probe cadence.
+func (l *Link) probeRTOLocked() time.Duration {
+	rto := l.srtt + 4*l.rttvar
+	if min := 3 * ProbeInterval; rto < min {
+		rto = min
+	}
+	if rto > 2*time.Second {
+		rto = 2 * time.Second
+	}
+	return rto
+}
+
+// OnProbeSent records that a probe left. The path goes down when the
+// oldest unanswered probe exceeds the RTO — not merely when acks lag the
+// send cadence. It returns the probe sequence to embed and whether the
+// path just went down.
+func (l *Link) OnProbeSent(now time.Time) (seq uint32, wentDown bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.probeOutstanding {
-		l.consecMissed++
-		l.consecAcked = 0
-		if l.up && l.consecMissed >= probeLossDown {
-			l.goDownLocked()
-			wentDown = true
-		}
+	if len(l.outstanding) > 0 && l.up && now.Sub(l.outstanding[0].at) > l.probeRTOLocked() {
+		l.goDownLocked()
+		l.outstanding = l.outstanding[:0]
+		wentDown = true
 	}
 	l.lastProbeSeq++
-	l.probeOutstanding = true
+	l.outstanding = append(l.outstanding, probeSent{seq: l.lastProbeSeq, at: now})
+	if len(l.outstanding) > 32 {
+		l.outstanding = l.outstanding[len(l.outstanding)-32:]
+	}
 	return l.lastProbeSeq, wentDown
 }
 
 // OnProbeAck ingests a probe ack: an RTT sample (RFC 6298) and a liveness
-// signal. It returns true when the path just transitioned to UP.
+// signal. Acks may arrive after newer probes were sent (RTT above the
+// cadence); any recent sequence counts. It returns true when the path
+// just transitioned to UP.
 func (l *Link) OnProbeAck(seq uint32, rtt time.Duration) (cameUp bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if seq != l.lastProbeSeq {
-		return false // stale ack; the newest probe is still outstanding
+	known := false
+	for i, o := range l.outstanding {
+		if o.seq == seq {
+			l.outstanding = append(l.outstanding[:0], l.outstanding[i+1:]...)
+			known = true
+			break
+		}
 	}
-	l.probeOutstanding = false
-	l.consecMissed = 0
+	if !known {
+		return false // duplicate or ancient ack
+	}
 	l.consecAcked++
 
 	if rtt > 0 {
@@ -137,6 +163,7 @@ func (l *Link) MarkDown() {
 func (l *Link) goDownLocked() {
 	l.up = false
 	l.consecAcked = 0
+	l.outstanding = l.outstanding[:0]
 	// A returning path re-earns its share instead of instantly absorbing
 	// its old ratio.
 	l.lossFactor = minLossFactor * 4

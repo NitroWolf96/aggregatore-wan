@@ -377,7 +377,7 @@ func (e *Engine) serverControlLoop() {
 					if !ps.Link.Up() && tick%10 != 0 {
 						continue // 500ms cadence while down
 					}
-					seq, wentDown := ps.Link.OnProbeSent()
+					seq, wentDown := ps.Link.OnProbeSent(now)
 					if wentDown {
 						e.log.Warn("path down", "session", sess.ID, "path", ps.id)
 					}

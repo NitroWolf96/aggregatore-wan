@@ -28,6 +28,19 @@ trap cleanup EXIT
 make -C "$ROOT" build >/dev/null
 BIN=$ROOT/bin
 
+iperf_srv() {
+    ip netns exec tr-cloud pkill -x iperf3 2>/dev/null || true
+    sleep 0.2
+    ip netns exec tr-cloud iperf3 -s -D
+    for _ in $(seq 1 25); do
+        ip netns exec tr-cloud ss -ltn 2>/dev/null | grep -q 5201 && { sleep 0.2; return 0; }
+        sleep 0.2
+    done
+    echo "iperf3 server failed to start" >&2
+    return 1
+}
+
+
 ./topo.sh up duo
 
 # 2% random drop on the uplink of both WANs (wansim ingress from the router).
@@ -82,8 +95,7 @@ run_stream() {
     ip netns exec tr-router "$BIN/treccia-client" -config "$WORK/client.yaml" > /tmp/treccia-test-client.log 2>&1 &
     CLIENT_PID=$!
     sleep 3
-    ip netns exec tr-cloud iperf3 -s -D -1
-    sleep 0.3
+    iperf_srv
     ip netns exec tr-router iperf3 -c 10.200.0.1 -u -b 20M -l 1200 -t 10 -J > "$WORK/out.json"
     kill "$CLIENT_PID" "$SERVER_PID" 2>/dev/null || true
     wait "$CLIENT_PID" "$SERVER_PID" 2>/dev/null || true

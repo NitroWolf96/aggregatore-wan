@@ -26,6 +26,19 @@ trap cleanup EXIT
 make -C "$ROOT" build >/dev/null
 BIN=$ROOT/bin
 
+iperf_srv() {
+    ip netns exec tr-cloud pkill -x iperf3 2>/dev/null || true
+    sleep 0.2
+    ip netns exec tr-cloud iperf3 -s -D
+    for _ in $(seq 1 25); do
+        ip netns exec tr-cloud ss -ltn 2>/dev/null | grep -q 5201 && { sleep 0.2; return 0; }
+        sleep 0.2
+    done
+    echo "iperf3 server failed to start" >&2
+    return 1
+}
+
+
 ./topo.sh up duo
 
 SERVER_PRIV=$("$BIN/treccia-server" genkey)
@@ -69,13 +82,11 @@ sleep 2
 bps() { python3 -c "import json,sys; print(json.load(sys.stdin)['end']['sum_received']['bits_per_second'])"; }
 
 echo "== baseline: single WAN1 (50 Mbit shaped) =="
-ip netns exec tr-cloud iperf3 -s -D -1
-sleep 0.3
+iperf_srv
 BASE=$(ip netns exec tr-router iperf3 -c 10.10.0.2 -B 10.11.1.2 -t "${DURATION:-5}" -J | bps)
 
 echo "== bonded: single TCP flow through the tunnel (50+30 Mbit) =="
-ip netns exec tr-cloud iperf3 -s -D -1
-sleep 0.3
+iperf_srv
 BOND=$(ip netns exec tr-router iperf3 -c 10.200.0.1 -t "${DURATION:-5}" -J | bps)
 
 # The bonded flow must beat the best single link (50 Mbit shaped).

@@ -26,6 +26,19 @@ trap cleanup EXIT
 make -C "$ROOT" build >/dev/null
 BIN=$ROOT/bin
 
+iperf_srv() {
+    ip netns exec tr-cloud pkill -x iperf3 2>/dev/null || true
+    sleep 0.2
+    ip netns exec tr-cloud iperf3 -s -D
+    for _ in $(seq 1 25); do
+        ip netns exec tr-cloud ss -ltn 2>/dev/null | grep -q 5201 && { sleep 0.2; return 0; }
+        sleep 0.2
+    done
+    echo "iperf3 server failed to start" >&2
+    return 1
+}
+
+
 ./topo.sh up "${PROFILE:-clean}"
 
 # Keys.
@@ -69,13 +82,11 @@ echo "== ping through the tunnel =="
 ip netns exec tr-router ping -c 3 -i 0.3 -W 2 10.200.0.1
 
 echo "== iperf3 upload through the tunnel =="
-ip netns exec tr-cloud iperf3 -s -D -1
-sleep 0.3
+iperf_srv
 ip netns exec tr-router iperf3 -c 10.200.0.1 -t "${DURATION:-5}" -f m
 
 echo "== iperf3 download through the tunnel =="
-ip netns exec tr-cloud iperf3 -s -D -1
-sleep 0.3
+iperf_srv
 ip netns exec tr-router iperf3 -c 10.200.0.1 -t "${DURATION:-5}" -f m -R
 
 echo "M1 OK"

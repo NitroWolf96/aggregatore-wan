@@ -554,7 +554,7 @@ func (e *Engine) clientProbeLoop() {
 			if !p.Link.Up() && tick%5 != 0 {
 				continue // 500ms cadence while down
 			}
-			seq, wentDown := p.Link.OnProbeSent()
+			seq, wentDown := p.Link.OnProbeSent(now)
 			if wentDown {
 				e.log.Warn("path down", "path", p.Name)
 			}

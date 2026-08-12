@@ -27,6 +27,19 @@ trap cleanup EXIT
 make -C "$ROOT" build >/dev/null
 BIN=$ROOT/bin
 
+iperf_srv() {
+    ip netns exec tr-cloud pkill -x iperf3 2>/dev/null || true
+    sleep 0.2
+    ip netns exec tr-cloud iperf3 -s -D
+    for _ in $(seq 1 25); do
+        ip netns exec tr-cloud ss -ltn 2>/dev/null | grep -q 5201 && { sleep 0.2; return 0; }
+        sleep 0.2
+    done
+    echo "iperf3 server failed to start" >&2
+    return 1
+}
+
+
 ./topo.sh up duo
 
 SERVER_PRIV=$("$BIN/treccia-server" genkey)
@@ -68,8 +81,7 @@ CLIENT_PID=$!
 sleep 3
 
 echo "== realtime UDP stream (160B packets, duplicated) + WAN failure =="
-ip netns exec tr-cloud iperf3 -s -D -1
-sleep 0.3
+iperf_srv
 LOG="$WORK/rt.json"
 ip netns exec tr-router iperf3 -c 10.200.0.1 -u -b 400k -l 160 -t 15 -J > "$LOG" &
 IPERF_PID=$!

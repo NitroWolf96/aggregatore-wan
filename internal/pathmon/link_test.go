@@ -7,7 +7,7 @@ import (
 
 func ackN(l *Link, n int, rtt time.Duration) {
 	for i := 0; i < n; i++ {
-		seq, _ := l.OnProbeSent()
+		seq, _ := l.OnProbeSent(time.Now())
 		l.OnProbeAck(seq, rtt)
 	}
 }
@@ -27,16 +27,19 @@ func TestUpAfterThreeAcks(t *testing.T) {
 	}
 }
 
-func TestDownAfterThreeMisses(t *testing.T) {
+func TestDownWhenProbesUnansweredPastRTO(t *testing.T) {
 	l := NewLink()
 	ackN(l, probeAckUp, 20*time.Millisecond)
+	now := time.Now()
 	var wentDown bool
-	for i := 0; i < probeLossDown+1; i++ {
-		_, wd := l.OnProbeSent()
+	// Probes at the normal cadence with no acks at all: the path must go
+	// down once the oldest unanswered probe ages past the RTO.
+	for i := 0; i < 8; i++ {
+		_, wd := l.OnProbeSent(now.Add(time.Duration(i) * ProbeInterval))
 		wentDown = wentDown || wd
 	}
 	if !wentDown || l.Up() {
-		t.Fatalf("must go down after %d misses (up=%v)", probeLossDown, l.Up())
+		t.Fatalf("must go down (up=%v)", l.Up())
 	}
 	// A recovered path re-earns its share: the loss discount is small.
 	if f := l.Snapshot().LossFactor; f > 0.5 {
@@ -48,15 +51,39 @@ func TestDownAfterThreeMisses(t *testing.T) {
 	}
 }
 
+// TestBufferbloatDoesNotFlap: when RTT exceeds the probe cadence (deep
+// queues under load), acks lag one probe behind — the path must stay up.
+func TestBufferbloatDoesNotFlap(t *testing.T) {
+	l := NewLink()
+	ackN(l, probeAckUp, 20*time.Millisecond)
+	now := time.Now()
+	pending := []uint32{}
+	for i := 0; i < 50; i++ {
+		seq, wentDown := l.OnProbeSent(now.Add(time.Duration(i) * ProbeInterval))
+		if wentDown {
+			t.Fatalf("flapped at probe %d", i)
+		}
+		pending = append(pending, seq)
+		// The ack that arrives now is for the probe sent 150ms ago.
+		if len(pending) > 1 {
+			l.OnProbeAck(pending[0], 150*time.Millisecond)
+			pending = pending[1:]
+		}
+	}
+	if !l.Up() {
+		t.Fatal("path must remain up under queueing delay")
+	}
+}
+
 func TestRFC6298(t *testing.T) {
 	l := NewLink()
-	seq, _ := l.OnProbeSent()
+	seq, _ := l.OnProbeSent(time.Now())
 	l.OnProbeAck(seq, 100*time.Millisecond)
 	s := l.Snapshot()
 	if s.SRTT != 100*time.Millisecond || s.RTTVar != 50*time.Millisecond {
 		t.Fatalf("first sample: srtt=%v rttvar=%v", s.SRTT, s.RTTVar)
 	}
-	seq, _ = l.OnProbeSent()
+	seq, _ = l.OnProbeSent(time.Now())
 	l.OnProbeAck(seq, 200*time.Millisecond)
 	s = l.Snapshot()
 	// SRTT = 7/8*100 + 1/8*200 = 112.5ms; RTTVAR = 3/4*50 + 1/4*|100-200| = 62.5ms
