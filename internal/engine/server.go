@@ -55,6 +55,7 @@ type Session struct {
 	paths     map[uint8]*pathState
 	lastSeen  atomic.Int64
 	globalSeq atomic.Uint32
+	rtSeq     atomic.Uint32
 	pathSeq   [256]atomic.Uint32
 	reorder   *reorder.Buffer[buffers.Packet]
 	wsched    *sched.Weighted
@@ -161,7 +162,11 @@ func (e *Engine) handleServerDatagram(slab *[]byte, n int, src netip.AddrPort) {
 		e.Stats.RxPackets.Add(1)
 		e.Stats.RxBytes.Add(uint64(n))
 		pkt := buffers.Packet{Slab: slab, Off: d.Len(), Len: len(payload)}
-		sess.reorder.Push(d.GlobalSeq, pkt)
+		if d.Class() == wire.ClassBulk {
+			sess.reorder.Push(d.GlobalSeq, pkt)
+		} else if !e.bind.Deliver(pkt, sess.Ep) {
+			e.Stats.RxDropQueue.Add(1)
+		}
 		return
 	case wire.TypeProbe:
 		if hh, pr, ok := control.ParseProbe(dgram, e.mac); ok {
@@ -426,30 +431,64 @@ func (e *Engine) serverSend(bufs [][]byte, ep *wgbridge.SessionEndpoint) error {
 			e.Stats.TxDropNoPath.Add(1)
 			continue
 		}
-		var ps *pathState
+		class := e.classifyCt(ct)
+
 		if len(usable) == 1 {
-			ps = usable[0]
-		} else {
-			ids := make([]uint8, len(usable))
-			weights := make([]float64, len(usable))
-			for i, u := range usable {
-				ids[i] = u.id
-				weights[i] = u.Link.Weight()
-			}
-			ps = usable[sess.wsched.Pick(ids, weights)]
+			seq := sess.seqFor(class)
+			e.serverSendData(sess, usable[0], class, false, seq, ct)
+			continue
 		}
-		e.serverSendData(sess, ps, ct)
+
+		switch class {
+		case wire.ClassRealtime, wire.ClassInteractive:
+			snaps := make([]pathmon.Snapshot, len(usable))
+			for i, u := range usable {
+				snaps[i] = u.Link.Snapshot()
+			}
+			first, second := pathmon.BestPair(snaps)
+			if first < 0 {
+				break // fall through to weighted striping
+			}
+			seq := sess.rtSeq.Add(1)
+			e.serverSendData(sess, usable[first], class, false, seq, ct)
+			if class == wire.ClassRealtime && second >= 0 {
+				e.serverSendData(sess, usable[second], class, true, seq, ct)
+			}
+			continue
+		}
+
+		ids := make([]uint8, len(usable))
+		weights := make([]float64, len(usable))
+		for i, u := range usable {
+			ids[i] = u.id
+			weights[i] = u.Link.Weight()
+		}
+		ps := usable[sess.wsched.Pick(ids, weights)]
+		e.serverSendData(sess, ps, wire.ClassBulk, false, sess.globalSeq.Add(1), ct)
 	}
 	return nil
 }
 
-func (e *Engine) serverSendData(sess *Session, ps *pathState, ct []byte) {
+// seqFor draws from the ordered bulk sequence space or the free-running
+// one used by classes that bypass the reorder buffer.
+func (s *Session) seqFor(class uint8) uint32 {
+	if class == wire.ClassBulk {
+		return s.globalSeq.Add(1)
+	}
+	return s.rtSeq.Add(1)
+}
+
+func (e *Engine) serverSendData(sess *Session, ps *pathState, class uint8, dup bool, seq uint32, ct []byte) {
 	slab := buffers.Get()
 	defer buffers.Put(slab)
+	flags := wire.ClassFlags(class)
+	if dup {
+		flags |= wire.FlagDup
+	}
 	d := wire.DataHeader{
-		Header:    wire.Header{Type: wire.TypeData, PathID: ps.id},
+		Header:    wire.Header{Type: wire.TypeData, Flags: flags, PathID: ps.id},
 		Session:   sess.ID,
-		GlobalSeq: sess.globalSeq.Add(1),
+		GlobalSeq: seq,
 		PathSeq:   sess.pathSeq[ps.id].Add(1),
 		TxTS:      e.txTS(),
 	}

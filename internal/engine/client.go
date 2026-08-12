@@ -208,8 +208,11 @@ func (e *Engine) sendablePaths() []*Path {
 	return registered
 }
 
-// clientSend is the wgbridge SendFunc: WireGuard ciphertext leaves here,
-// striped per packet in proportion to each path's measured capacity.
+// clientSend is the wgbridge SendFunc: WireGuard ciphertext leaves here.
+// BULK is striped in proportion to each path's measured capacity;
+// REALTIME is duplicated on the two lowest-latency paths (the second copy
+// is deduplicated for free by WireGuard's anti-replay window); INTERACTIVE
+// sticks to the single best-latency path.
 func (e *Engine) clientSend(bufs [][]byte, _ *wgbridge.SessionEndpoint) error {
 	for _, ct := range bufs {
 		paths := e.sendablePaths()
@@ -217,29 +220,63 @@ func (e *Engine) clientSend(bufs [][]byte, _ *wgbridge.SessionEndpoint) error {
 			e.Stats.TxDropNoPath.Add(1)
 			continue
 		}
-		var p *Path
+		class := e.classifyCt(ct)
+
 		if len(paths) == 1 {
-			p = paths[0]
-		} else {
-			ids := make([]uint8, len(paths))
-			weights := make([]float64, len(paths))
-			for i, pp := range paths {
-				ids[i] = pp.ID
-				weights[i] = pp.Link.Weight()
-			}
-			p = paths[e.wsched.Pick(ids, weights)]
+			seq := e.seqFor(class)
+			e.sendDataOn(paths[0], class, false, e.session, seq, ct)
+			continue
 		}
-		e.sendDataOn(p, e.session, e.globalSeq.Add(1), ct)
+
+		switch class {
+		case wire.ClassRealtime, wire.ClassInteractive:
+			snaps := make([]pathmon.Snapshot, len(paths))
+			for i, p := range paths {
+				snaps[i] = p.Link.Snapshot()
+			}
+			first, second := pathmon.BestPair(snaps)
+			if first < 0 {
+				break // no probed path yet: fall through to weighted striping
+			}
+			seq := e.rtSeq.Add(1)
+			e.sendDataOn(paths[first], class, false, e.session, seq, ct)
+			if class == wire.ClassRealtime && second >= 0 {
+				e.sendDataOn(paths[second], class, true, e.session, seq, ct)
+			}
+			continue
+		}
+
+		ids := make([]uint8, len(paths))
+		weights := make([]float64, len(paths))
+		for i, pp := range paths {
+			ids[i] = pp.ID
+			weights[i] = pp.Link.Weight()
+		}
+		p := paths[e.wsched.Pick(ids, weights)]
+		e.sendDataOn(p, wire.ClassBulk, false, e.session, e.globalSeq.Add(1), ct)
 	}
 	return nil
 }
 
+// seqFor draws from the ordered bulk sequence space or the free-running
+// one used by classes that bypass the reorder buffer.
+func (e *Engine) seqFor(class uint8) uint32 {
+	if class == wire.ClassBulk {
+		return e.globalSeq.Add(1)
+	}
+	return e.rtSeq.Add(1)
+}
+
 // sendDataOn frames one ciphertext datagram and writes it to the path.
-func (e *Engine) sendDataOn(p *Path, session, seq uint32, ct []byte) {
+func (e *Engine) sendDataOn(p *Path, class uint8, dup bool, session, seq uint32, ct []byte) {
 	slab := buffers.Get()
 	defer buffers.Put(slab)
+	flags := wire.ClassFlags(class)
+	if dup {
+		flags |= wire.FlagDup
+	}
 	d := wire.DataHeader{
-		Header:    wire.Header{Type: wire.TypeData, PathID: p.ID},
+		Header:    wire.Header{Type: wire.TypeData, Flags: flags, PathID: p.ID},
 		Session:   session,
 		GlobalSeq: seq,
 		PathSeq:   p.pathSeq.Add(1),
@@ -307,7 +344,13 @@ func (e *Engine) handleClientDatagram(p *Path, slab *[]byte, n int) {
 		e.Stats.RxPackets.Add(1)
 		e.Stats.RxBytes.Add(uint64(n))
 		pkt := buffers.Packet{Slab: slab, Off: d.Len(), Len: len(payload)}
-		e.reorderBuf.Push(d.GlobalSeq, pkt)
+		if d.Class() == wire.ClassBulk {
+			e.reorderBuf.Push(d.GlobalSeq, pkt)
+		} else if !e.bind.Deliver(pkt, e.clientEp) {
+			// Latency-sensitive classes bypass the reorder buffer; WireGuard
+			// anti-replay swallows the duplicated copies.
+			e.Stats.RxDropQueue.Add(1)
+		}
 		return
 	case wire.TypeProbe:
 		if hh, pr, ok := control.ParseProbe(dgram, e.mac); ok && pr.Session == e.session {

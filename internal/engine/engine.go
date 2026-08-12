@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/nitrowolf96/aggregatore-wan/internal/buffers"
+	"github.com/nitrowolf96/aggregatore-wan/internal/classify"
 	"github.com/nitrowolf96/aggregatore-wan/internal/reorder"
 	"github.com/nitrowolf96/aggregatore-wan/internal/sched"
 	"github.com/nitrowolf96/aggregatore-wan/internal/wgbridge"
@@ -41,11 +42,12 @@ type Counters struct {
 
 // Config parametrizes a new engine.
 type Config struct {
-	Mode     Mode
-	MAC      *wire.MAC
-	Session  uint32 // client only: the session id it will register
-	ClientID uint64 // client only: random identity echoed in HELLO_ACK
-	Logger   *slog.Logger
+	Mode       Mode
+	MAC        *wire.MAC
+	Session    uint32 // client only: the session id it will register
+	ClientID   uint64 // client only: random identity echoed in HELLO_ACK
+	Logger     *slog.Logger
+	Classifier *classify.Classifier // nil disables classification (all bulk)
 }
 
 // Engine is one side of the multipath tunnel.
@@ -64,6 +66,10 @@ type Engine struct {
 
 	Stats Counters
 
+	classifier *classify.Classifier
+	correlator *wgbridge.Correlator
+	rtSeq      atomic.Uint32 // sequence pool for non-bulk packets (stats/dup only)
+
 	// Client state.
 	pathsMu    sync.RWMutex
 	paths      []*Path
@@ -79,12 +85,14 @@ type Engine struct {
 // New builds an engine; Run starts its loops.
 func New(cfg Config) *Engine {
 	e := &Engine{
-		mode:     cfg.Mode,
-		log:      cfg.Logger,
-		mac:      cfg.MAC,
-		start:    time.Now(),
-		session:  cfg.Session,
-		clientID: cfg.ClientID,
+		mode:       cfg.Mode,
+		log:        cfg.Logger,
+		mac:        cfg.MAC,
+		start:      time.Now(),
+		session:    cfg.Session,
+		clientID:   cfg.ClientID,
+		classifier: cfg.Classifier,
+		correlator: &wgbridge.Correlator{},
 	}
 	e.ctx, e.cancel = context.WithCancel(context.Background())
 	if cfg.Mode == ModeClient {
@@ -115,6 +123,37 @@ func (e *Engine) newReorder(ep *wgbridge.SessionEndpoint) *reorder.Buffer[buffer
 
 // Bind returns the conn.Bind to hand to wireguard-go.
 func (e *Engine) Bind() *wgbridge.EngineBind { return e.bind }
+
+// Inspect returns the TUN-shim hook that classifies outbound plaintext and
+// feeds the plaintext->ciphertext correlator; nil when classification is
+// disabled.
+func (e *Engine) Inspect() wgbridge.InspectFunc {
+	if e.classifier == nil {
+		return nil
+	}
+	return func(pkt []byte) {
+		e.correlator.PushPlain(e.classifier.Classify(pkt), len(pkt))
+	}
+}
+
+// classifyCt maps one outbound WireGuard datagram to its traffic class.
+// Handshakes and keepalives ride the lowest-latency path; transport data
+// takes the class recorded by the correlator.
+func (e *Engine) classifyCt(ct []byte) uint8 {
+	if len(ct) < 4 {
+		return wire.ClassInteractive
+	}
+	if ct[0] != 4 { // handshake initiation/response/cookie
+		return wire.ClassInteractive
+	}
+	if len(ct) == 32 { // keepalive: empty transport payload
+		return wire.ClassInteractive
+	}
+	if e.classifier == nil {
+		return wire.ClassBulk
+	}
+	return e.correlator.MatchCiphertext(len(ct))
+}
 
 // txTS returns the sender clock in microseconds, truncated to 32 bits.
 func (e *Engine) txTS() uint32 {

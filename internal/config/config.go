@@ -9,6 +9,8 @@ import (
 	"os"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/nitrowolf96/aggregatore-wan/internal/classify"
 )
 
 // DefaultMTU is the tunnel MTU: 1428 (typical 4G APN MTU) minus the worst
@@ -39,12 +41,36 @@ type Dashboard struct {
 	Token  string `yaml:"token"`  // optional bearer token
 }
 
+// Classify configures per-flow classification.
+type Classify struct {
+	Disabled bool            `yaml:"disabled"`
+	Rules    []classify.Rule `yaml:"rules"`
+}
+
+func (c *Classify) validate() error {
+	for i, r := range c.Rules {
+		if _, ok := classify.ParseClass(r.Class); !ok {
+			return fmt.Errorf("classify.rules[%d].class %q: want bulk, realtime or interactive", i, r.Class)
+		}
+		if r.Port == 0 {
+			return fmt.Errorf("classify.rules[%d]: port is required", i)
+		}
+		switch r.Proto {
+		case "tcp", "udp", "any", "":
+		default:
+			return fmt.Errorf("classify.rules[%d].proto %q: want tcp, udp or any", i, r.Proto)
+		}
+	}
+	return nil
+}
+
 // Client is the configuration of treccia-client.
 type Client struct {
 	Tunnel     Tunnel    `yaml:"tunnel"`
 	ServerAddr string    `yaml:"server_addr"`
 	ControlPSK string    `yaml:"control_psk"`
 	Paths      []Path    `yaml:"paths"`
+	Classify   Classify  `yaml:"classify"`
 	Dashboard  Dashboard `yaml:"dashboard"`
 }
 
@@ -53,6 +79,7 @@ type Server struct {
 	Tunnel     Tunnel    `yaml:"tunnel"`
 	Listen     string    `yaml:"listen"`
 	ControlPSK string    `yaml:"control_psk"`
+	Classify   Classify  `yaml:"classify"`
 	Dashboard  Dashboard `yaml:"dashboard"`
 }
 
@@ -108,6 +135,9 @@ func LoadClient(path string) (*Client, error) {
 	if len(c.Paths) > 250 {
 		return nil, fmt.Errorf("too many paths (max 250)")
 	}
+	if err := c.Classify.validate(); err != nil {
+		return nil, err
+	}
 	seen := map[string]bool{}
 	for i := range c.Paths {
 		p := &c.Paths[i]
@@ -142,6 +172,9 @@ func LoadServer(path string) (*Server, error) {
 	}
 	if s.ControlPSK == "" {
 		return nil, fmt.Errorf("control_psk is required")
+	}
+	if err := s.Classify.validate(); err != nil {
+		return nil, err
 	}
 	return &s, nil
 }

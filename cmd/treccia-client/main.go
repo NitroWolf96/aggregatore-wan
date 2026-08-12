@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nitrowolf96/aggregatore-wan/internal/classify"
 	"github.com/nitrowolf96/aggregatore-wan/internal/cli"
 	"github.com/nitrowolf96/aggregatore-wan/internal/config"
 	"github.com/nitrowolf96/aggregatore-wan/internal/engine"
@@ -52,15 +53,20 @@ func main() {
 	session := binary.BigEndian.Uint32(rnd[0:4]) | 1 // never zero
 	clientID := binary.BigEndian.Uint64(rnd[4:12])
 
+	var classifier *classify.Classifier
+	if !cfg.Classify.Disabled {
+		classifier = classify.New(cfg.Classify.Rules)
+	}
 	eng := engine.New(engine.Config{
-		Mode:     engine.ModeClient,
-		MAC:      wire.NewMAC(wire.DeriveKey(cfg.ControlPSK)),
-		Session:  session,
-		ClientID: clientID,
-		Logger:   log,
+		Mode:       engine.ModeClient,
+		MAC:        wire.NewMAC(wire.DeriveKey(cfg.ControlPSK)),
+		Session:    session,
+		ClientID:   clientID,
+		Logger:     log,
+		Classifier: classifier,
 	})
 
-	wg, err := wgbridge.NewWG(cfg.Tunnel, eng.Bind(), nil, log, true)
+	wg, err := wgbridge.NewWG(cfg.Tunnel, eng.Bind(), eng.Inspect(), log, true)
 	if err != nil {
 		log.Error("wireguard", "err", err)
 		os.Exit(1)

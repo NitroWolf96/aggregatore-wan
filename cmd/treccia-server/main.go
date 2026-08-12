@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/nitrowolf96/aggregatore-wan/internal/classify"
 	"github.com/nitrowolf96/aggregatore-wan/internal/cli"
 	"github.com/nitrowolf96/aggregatore-wan/internal/config"
 	"github.com/nitrowolf96/aggregatore-wan/internal/engine"
@@ -41,13 +42,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	var classifier *classify.Classifier
+	if !cfg.Classify.Disabled {
+		classifier = classify.New(cfg.Classify.Rules)
+	}
 	eng := engine.New(engine.Config{
-		Mode:   engine.ModeServer,
-		MAC:    wire.NewMAC(wire.DeriveKey(cfg.ControlPSK)),
-		Logger: log,
+		Mode:       engine.ModeServer,
+		MAC:        wire.NewMAC(wire.DeriveKey(cfg.ControlPSK)),
+		Logger:     log,
+		Classifier: classifier,
 	})
 
-	wg, err := wgbridge.NewWG(cfg.Tunnel, eng.Bind(), nil, log, false)
+	wg, err := wgbridge.NewWG(cfg.Tunnel, eng.Bind(), eng.Inspect(), log, false)
 	if err != nil {
 		log.Error("wireguard", "err", err)
 		os.Exit(1)
