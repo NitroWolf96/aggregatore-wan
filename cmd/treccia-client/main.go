@@ -82,15 +82,6 @@ func main() {
 	}
 	defer wg.Close()
 
-	name, err := wg.Tun.Name()
-	if err != nil {
-		name = cfg.Tunnel.Interface
-	}
-	if err := wgbridge.SetupNetdev(name, cfg.Tunnel.Address, cfg.Tunnel.Routes); err != nil {
-		log.Error("netdev", "err", err)
-		os.Exit(1)
-	}
-
 	for _, p := range cfg.Paths {
 		if _, err := eng.AddPath(p.Name, p.Bind, cfg.ServerAddr); err != nil {
 			log.Error("path", "name", p.Name, "err", err)
@@ -102,6 +93,18 @@ func main() {
 
 	if err := eng.WaitReady(10 * time.Second); err != nil {
 		log.Warn("no path registered yet, continuing anyway", "err", err)
+	}
+
+	// Bringing the TUN link up makes wireguard-go activate itself (it
+	// watches interface events), so this happens only after a path is
+	// ready to carry the first handshake.
+	name, err := wg.Tun.Name()
+	if err != nil {
+		name = cfg.Tunnel.Interface
+	}
+	if err := wgbridge.SetupNetdev(name, cfg.Tunnel.Address, cfg.Tunnel.Routes); err != nil {
+		log.Error("netdev", "err", err)
+		os.Exit(1)
 	}
 	if err := wg.Up(); err != nil {
 		log.Error("wireguard up", "err", err)

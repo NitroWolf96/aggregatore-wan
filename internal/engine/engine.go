@@ -94,6 +94,13 @@ type Engine struct {
 	wsched     *sched.Weighted
 	reorderBuf *reorder.Buffer[buffers.Packet]
 
+	// Ciphertext WireGuard emits before any path has registered (its very
+	// first handshake initiation, typically). Dropping it would cost the
+	// 5s handshake rate-limit at every cold start, so it waits here and is
+	// flushed on the first registration.
+	pendingMu sync.Mutex
+	pending   [][]byte
+
 	// Server state.
 	server *serverState
 }

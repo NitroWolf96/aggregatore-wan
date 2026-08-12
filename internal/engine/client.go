@@ -237,7 +237,7 @@ func (e *Engine) clientSend(bufs [][]byte, _ *wgbridge.SessionEndpoint) error {
 	for _, ct := range bufs {
 		paths := e.sendablePaths()
 		if len(paths) == 0 {
-			e.Stats.TxDropNoPath.Add(1)
+			e.holdPending(ct)
 			continue
 		}
 		class := e.classifyCt(ct)
@@ -452,11 +452,41 @@ func (e *Engine) handleClientDatagram(p *Path, slab *[]byte, n int) {
 			control.FreshTS(m.UnixTS, now) {
 			if !p.registered.Swap(true) {
 				e.log.Info("path registered", "path", p.Name, "id", p.ID)
+				e.flushPending()
 			}
 			p.lastRxNano.Store(now.UnixNano())
 		}
 	}
 	buffers.Put(slab)
+}
+
+// pendingCap bounds the pre-registration queue; a cold start only ever
+// stages a handful of handshake/keepalive datagrams.
+const pendingCap = 64
+
+// holdPending stages ciphertext until a path registers.
+func (e *Engine) holdPending(ct []byte) {
+	e.pendingMu.Lock()
+	defer e.pendingMu.Unlock()
+	if len(e.pending) >= pendingCap {
+		e.Stats.TxDropNoPath.Add(1)
+		return
+	}
+	e.pending = append(e.pending, append([]byte(nil), ct...))
+}
+
+// flushPending replays staged ciphertext through the normal send path once
+// the first path has registered.
+func (e *Engine) flushPending() {
+	e.pendingMu.Lock()
+	staged := e.pending
+	e.pending = nil
+	e.pendingMu.Unlock()
+	if len(staged) == 0 {
+		return
+	}
+	e.log.Debug("flushing pre-registration ciphertext", "packets", len(staged))
+	e.clientSend(staged, nil)
 }
 
 // onClientCtrl feeds the server's receive report into each path estimator.
