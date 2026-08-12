@@ -284,7 +284,16 @@ func (l *Link) updateDelayLocked(owdMinUS, owdAvgUS int32, now time.Time) {
 	}
 	l.queueUS = q
 	if q > 2*targetQueueUS {
-		l.delayFactor *= delayCut
+		// Proportional cut: the deeper the standing queue, the harder the
+		// weight drops (floor 0.5x per report), so overshoot drains fast.
+		cut := 2 * targetQueueUS / q
+		if cut < 0.5 {
+			cut = 0.5
+		}
+		if cut > delayCut {
+			cut = delayCut
+		}
+		l.delayFactor *= cut
 		if l.delayFactor < minDelayFactor {
 			l.delayFactor = minDelayFactor
 		}

@@ -77,13 +77,16 @@ func New[T any](deliver func(T, bool), drop func(T), now func() time.Time) *Buff
 	}
 }
 
-// SetHold adjusts the gap timeout (clamped to [2ms, 100ms]).
+// SetHold adjusts the gap timeout (clamped to [2ms, 250ms]). Only the
+// bulk stream pays this latency — realtime and interactive classes bypass
+// the buffer — so a generous ceiling beats mass timeouts when a path's
+// queue momentarily bloats.
 func (b *Buffer[T]) SetHold(d time.Duration) {
 	if d < 2*time.Millisecond {
 		d = 2 * time.Millisecond
 	}
-	if d > 100*time.Millisecond {
-		d = 100 * time.Millisecond
+	if d > 250*time.Millisecond {
+		d = 250 * time.Millisecond
 	}
 	b.mu.Lock()
 	b.hold = d

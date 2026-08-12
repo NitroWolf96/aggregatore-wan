@@ -416,18 +416,22 @@ func (e *Engine) serverControlLoop() {
 			e.server.sock.WriteToUDPAddrPort(
 				control.EncodeCtrl(wire.Header{PathID: best.id}, c, e.mac), best.addr)
 
-			// Retune this session's reorder hold and FEC once a second.
-			if tick%20 == 0 {
+			// Retune this session's reorder hold fast (250ms) and FEC 1/s.
+			if tick%5 == 0 {
 				views := make([][2]float64, 0, len(alive))
-				snaps := make([]pathmon.Snapshot, 0, len(alive))
 				for _, ps := range alive {
 					if ew, j, ok := ps.Rx.OwdView(now, 3*time.Second); ok {
 						views = append(views, [2]float64{ew, j})
 					}
-					snaps = append(snaps, ps.Link.Snapshot())
 				}
 				if hold := pathmon.ComputeHold(views); hold > 0 {
 					sess.reorder.SetHold(hold)
+				}
+			}
+			if tick%20 == 0 {
+				snaps := make([]pathmon.Snapshot, 0, len(alive))
+				for _, ps := range alive {
+					snaps = append(snaps, ps.Link.Snapshot())
 				}
 				e.retuneFEC(sess.fecEnc, snaps)
 			}

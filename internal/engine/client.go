@@ -105,7 +105,8 @@ const (
 	helloRefresh = 15 * time.Second
 	ctrlBusy     = 50 * time.Millisecond
 	ctrlIdle     = 250 * time.Millisecond
-	holdRetune   = 1 * time.Second
+	holdRetune   = 250 * time.Millisecond
+	fecRetune    = 1 * time.Second
 	redialEvery  = 2 * time.Second
 )
 
@@ -583,6 +584,7 @@ func (e *Engine) clientCtrlLoop() {
 	var lastSent time.Time
 	var lastRxPkts uint64
 	var lastRetune time.Time
+	var lastFEC time.Time
 	for {
 		select {
 		case <-e.ctx.Done():
@@ -620,15 +622,20 @@ func (e *Engine) clientCtrlLoop() {
 		if now.Sub(lastRetune) >= holdRetune {
 			lastRetune = now
 			views := make([][2]float64, 0, len(paths))
-			snaps := make([]pathmon.Snapshot, 0, len(paths))
 			for _, p := range paths {
 				if e, j, ok := p.Rx.OwdView(now, 3*time.Second); ok {
 					views = append(views, [2]float64{e, j})
 				}
-				snaps = append(snaps, p.Link.Snapshot())
 			}
 			if hold := pathmon.ComputeHold(views); hold > 0 {
 				e.reorderBuf.SetHold(hold)
+			}
+		}
+		if now.Sub(lastFEC) >= fecRetune {
+			lastFEC = now
+			snaps := make([]pathmon.Snapshot, 0, len(paths))
+			for _, p := range paths {
+				snaps = append(snaps, p.Link.Snapshot())
 			}
 			e.retuneFEC(e.fecEnc, snaps)
 		}
