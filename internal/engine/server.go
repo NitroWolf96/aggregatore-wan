@@ -11,6 +11,7 @@ import (
 
 	"github.com/nitrowolf96/aggregatore-wan/internal/buffers"
 	"github.com/nitrowolf96/aggregatore-wan/internal/control"
+	"github.com/nitrowolf96/aggregatore-wan/internal/fec"
 	"github.com/nitrowolf96/aggregatore-wan/internal/pathmon"
 	"github.com/nitrowolf96/aggregatore-wan/internal/reorder"
 	"github.com/nitrowolf96/aggregatore-wan/internal/sched"
@@ -59,6 +60,8 @@ type Session struct {
 	pathSeq   [256]atomic.Uint32
 	reorder   *reorder.Buffer[buffers.Packet]
 	wsched    *sched.Weighted
+	fecEnc    *fec.Encoder
+	fecDec    *fec.Decoder
 }
 
 // touchPath refreshes (or creates) the state of one path; the newest source
@@ -107,7 +110,11 @@ func (e *Engine) Listen(listen string) error {
 		return err
 	}
 	e.server.sock = sock
-	for _, loop := range []func(){e.serverRxLoop, e.serverControlLoop, e.sessionReaper} {
+	loops := []func(){e.serverRxLoop, e.serverControlLoop, e.sessionReaper}
+	if !e.fecDisabled {
+		loops = append(loops, e.serverFecFlushLoop)
+	}
+	for _, loop := range loops {
 		e.wg.Add(1)
 		go func() {
 			defer e.wg.Done()
@@ -116,6 +123,24 @@ func (e *Engine) Listen(listen string) error {
 	}
 	e.log.Info("listening", "addr", sock.LocalAddr())
 	return nil
+}
+
+// serverFecFlushLoop closes stale partial FEC groups of every session.
+func (e *Engine) serverFecFlushLoop() {
+	t := time.NewTicker(fec.FlushTimeout / 2)
+	defer t.Stop()
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case now := <-t.C:
+			for _, sess := range e.allSessions() {
+				if sess.fecEnc != nil {
+					sess.fecEnc.Flush(now)
+				}
+			}
+		}
+	}
 }
 
 func (e *Engine) serverRxLoop() {
@@ -163,11 +188,22 @@ func (e *Engine) handleServerDatagram(slab *[]byte, n int, src netip.AddrPort) {
 		e.Stats.RxBytes.Add(uint64(n))
 		pkt := buffers.Packet{Slab: slab, Off: d.Len(), Len: len(payload)}
 		if d.Class() == wire.ClassBulk {
+			if d.Flags&wire.FlagFECInfo != 0 && sess.fecDec != nil {
+				sess.fecDec.AddData(d.FECGroup, d.FECIndex, d.GlobalSeq, payload, now)
+			}
 			sess.reorder.Push(d.GlobalSeq, pkt)
 		} else if !e.bind.Deliver(pkt, sess.Ep) {
 			e.Stats.RxDropQueue.Add(1)
 		}
 		return
+	case wire.TypeFEC:
+		if f, shard, err := wire.ParseFEC(dgram); err == nil {
+			if sess := e.lookupSession(f.Session); sess != nil && sess.fecDec != nil {
+				e.Stats.RxPackets.Add(1)
+				e.Stats.RxBytes.Add(uint64(n))
+				sess.fecDec.AddParity(f.Group, f.Index, f.K, f.M, shard, now)
+			}
+		}
 	case wire.TypeProbe:
 		if hh, pr, ok := control.ParseProbe(dgram, e.mac); ok {
 			if sess := e.lookupSession(pr.Session); sess != nil {
@@ -226,6 +262,18 @@ func (e *Engine) handleHello(dgram []byte, src netip.AddrPort) {
 			paths:    make(map[uint8]*pathState),
 			reorder:  e.newReorder(ep),
 			wsched:   sched.NewWeighted(),
+		}
+		if !e.fecDisabled {
+			s := sess
+			s.fecEnc = fec.NewEncoder(func(group uint32, index, k, m uint8, shard []byte) {
+				e.serverEmitParity(s, group, index, k, m, shard)
+			})
+			s.fecEnc.SetParams(e.fecForce)
+			s.fecDec = fec.NewDecoder(func(seq uint32, ct []byte) {
+				slab := buffers.Get()
+				n := copy(*slab, ct)
+				s.reorder.Push(seq, buffers.Packet{Slab: slab, Len: n})
+			})
 		}
 		st.sessions[m.Session] = sess
 		e.log.Info("session created", "session", m.Session, "src", src)
@@ -368,17 +416,20 @@ func (e *Engine) serverControlLoop() {
 			e.server.sock.WriteToUDPAddrPort(
 				control.EncodeCtrl(wire.Header{PathID: best.id}, c, e.mac), best.addr)
 
-			// Retune this session's reorder hold once a second.
+			// Retune this session's reorder hold and FEC once a second.
 			if tick%20 == 0 {
 				views := make([][2]float64, 0, len(alive))
+				snaps := make([]pathmon.Snapshot, 0, len(alive))
 				for _, ps := range alive {
 					if ew, j, ok := ps.Rx.OwdView(now, 3*time.Second); ok {
 						views = append(views, [2]float64{ew, j})
 					}
+					snaps = append(snaps, ps.Link.Snapshot())
 				}
 				if hold := pathmon.ComputeHold(views); hold > 0 {
 					sess.reorder.SetHold(hold)
 				}
+				e.retuneFEC(sess.fecEnc, snaps)
 			}
 		}
 	}
@@ -433,9 +484,8 @@ func (e *Engine) serverSend(bufs [][]byte, ep *wgbridge.SessionEndpoint) error {
 		}
 		class := e.classifyCt(ct)
 
-		if len(usable) == 1 {
-			seq := sess.seqFor(class)
-			e.serverSendData(sess, usable[0], class, false, seq, ct)
+		if len(usable) == 1 && class != wire.ClassBulk {
+			e.serverSendData(sess, usable[0], class, false, sess.rtSeq.Add(1), fecTag{}, ct)
 			continue
 		}
 
@@ -450,40 +500,82 @@ func (e *Engine) serverSend(bufs [][]byte, ep *wgbridge.SessionEndpoint) error {
 				break // fall through to weighted striping
 			}
 			seq := sess.rtSeq.Add(1)
-			e.serverSendData(sess, usable[first], class, false, seq, ct)
+			e.serverSendData(sess, usable[first], class, false, seq, fecTag{}, ct)
 			if class == wire.ClassRealtime && second >= 0 {
-				e.serverSendData(sess, usable[second], class, true, seq, ct)
+				e.serverSendData(sess, usable[second], class, true, seq, fecTag{}, ct)
 			}
 			continue
 		}
 
-		ids := make([]uint8, len(usable))
-		weights := make([]float64, len(usable))
-		for i, u := range usable {
-			ids[i] = u.id
-			weights[i] = u.Link.Weight()
+		ps := usable[0]
+		if len(usable) > 1 {
+			ids := make([]uint8, len(usable))
+			weights := make([]float64, len(usable))
+			for i, u := range usable {
+				ids[i] = u.id
+				weights[i] = u.Link.Weight()
+			}
+			ps = usable[sess.wsched.Pick(ids, weights)]
 		}
-		ps := usable[sess.wsched.Pick(ids, weights)]
-		e.serverSendData(sess, ps, wire.ClassBulk, false, sess.globalSeq.Add(1), ct)
+		seq := sess.globalSeq.Add(1)
+		var tag fecTag
+		if sess.fecEnc != nil {
+			if g, idx, on := sess.fecEnc.Add(seq, ct, time.Now()); on {
+				tag = fecTag{on: true, group: g, index: idx}
+			}
+		}
+		e.serverSendData(sess, ps, wire.ClassBulk, false, seq, tag, ct)
 	}
 	return nil
 }
 
-// seqFor draws from the ordered bulk sequence space or the free-running
-// one used by classes that bypass the reorder buffer.
-func (s *Session) seqFor(class uint8) uint32 {
-	if class == wire.ClassBulk {
-		return s.globalSeq.Add(1)
+// serverEmitParity schedules one parity shard of a session onto its paths.
+func (e *Engine) serverEmitParity(sess *Session, group uint32, index, k, m uint8, shard []byte) {
+	alive := sess.alivePaths(time.Now().UnixNano())
+	if len(alive) == 0 {
+		return
 	}
-	return s.rtSeq.Add(1)
+	ps := alive[0]
+	if len(alive) > 1 {
+		ids := make([]uint8, len(alive))
+		weights := make([]float64, len(alive))
+		for i, u := range alive {
+			ids[i] = u.id
+			weights[i] = u.Link.Weight()
+		}
+		ps = alive[sess.wsched.Pick(ids, weights)]
+	}
+	slab := buffers.Get()
+	defer buffers.Put(slab)
+	f := wire.FECHeader{
+		Header:   wire.Header{PathID: ps.id},
+		Session:  sess.ID,
+		Group:    group,
+		Index:    index,
+		K:        k,
+		M:        m,
+		ShardLen: uint16(len(shard)),
+	}
+	n := wire.PutFECHeader(*slab, &f)
+	if n+len(shard) > len(*slab) {
+		return
+	}
+	c := copy((*slab)[n:], shard)
+	if _, err := e.server.sock.WriteToUDPAddrPort((*slab)[:n+c], ps.addr); err == nil {
+		e.Stats.TxPackets.Add(1)
+		e.Stats.TxBytes.Add(uint64(n + c))
+	}
 }
 
-func (e *Engine) serverSendData(sess *Session, ps *pathState, class uint8, dup bool, seq uint32, ct []byte) {
+func (e *Engine) serverSendData(sess *Session, ps *pathState, class uint8, dup bool, seq uint32, tag fecTag, ct []byte) {
 	slab := buffers.Get()
 	defer buffers.Put(slab)
 	flags := wire.ClassFlags(class)
 	if dup {
 		flags |= wire.FlagDup
+	}
+	if tag.on {
+		flags |= wire.FlagFECInfo
 	}
 	d := wire.DataHeader{
 		Header:    wire.Header{Type: wire.TypeData, Flags: flags, PathID: ps.id},
@@ -491,6 +583,8 @@ func (e *Engine) serverSendData(sess *Session, ps *pathState, class uint8, dup b
 		GlobalSeq: seq,
 		PathSeq:   sess.pathSeq[ps.id].Add(1),
 		TxTS:      e.txTS(),
+		FECGroup:  tag.group,
+		FECIndex:  tag.index,
 	}
 	n := wire.PutDataHeader(*slab, &d)
 	if n+len(ct) > len(*slab) {

@@ -14,6 +14,8 @@ import (
 
 	"github.com/nitrowolf96/aggregatore-wan/internal/buffers"
 	"github.com/nitrowolf96/aggregatore-wan/internal/classify"
+	"github.com/nitrowolf96/aggregatore-wan/internal/fec"
+	"github.com/nitrowolf96/aggregatore-wan/internal/pathmon"
 	"github.com/nitrowolf96/aggregatore-wan/internal/reorder"
 	"github.com/nitrowolf96/aggregatore-wan/internal/sched"
 	"github.com/nitrowolf96/aggregatore-wan/internal/wgbridge"
@@ -22,6 +24,13 @@ import (
 
 // Mode selects the client or server role of the engine.
 type Mode int
+
+// fecTag carries the FEC group assignment of one outgoing bulk packet.
+type fecTag struct {
+	on    bool
+	group uint32
+	index uint8
+}
 
 const (
 	ModeClient Mode = iota
@@ -42,12 +51,14 @@ type Counters struct {
 
 // Config parametrizes a new engine.
 type Config struct {
-	Mode       Mode
-	MAC        *wire.MAC
-	Session    uint32 // client only: the session id it will register
-	ClientID   uint64 // client only: random identity echoed in HELLO_ACK
-	Logger     *slog.Logger
-	Classifier *classify.Classifier // nil disables classification (all bulk)
+	Mode        Mode
+	MAC         *wire.MAC
+	Session     uint32 // client only: the session id it will register
+	ClientID    uint64 // client only: random identity echoed in HELLO_ACK
+	Logger      *slog.Logger
+	Classifier  *classify.Classifier // nil disables classification (all bulk)
+	FECDisabled bool
+	FECForce    fec.Params // fixed geometry override; zero = adaptive
 }
 
 // Engine is one side of the multipath tunnel.
@@ -70,6 +81,11 @@ type Engine struct {
 	correlator *wgbridge.Correlator
 	rtSeq      atomic.Uint32 // sequence pool for non-bulk packets (stats/dup only)
 
+	fecDisabled bool
+	fecForce    fec.Params
+	fecEnc      *fec.Encoder // client TX; server sessions have their own
+	fecDec      *fec.Decoder // client RX
+
 	// Client state.
 	pathsMu    sync.RWMutex
 	paths      []*Path
@@ -85,14 +101,16 @@ type Engine struct {
 // New builds an engine; Run starts its loops.
 func New(cfg Config) *Engine {
 	e := &Engine{
-		mode:       cfg.Mode,
-		log:        cfg.Logger,
-		mac:        cfg.MAC,
-		start:      time.Now(),
-		session:    cfg.Session,
-		clientID:   cfg.ClientID,
-		classifier: cfg.Classifier,
-		correlator: &wgbridge.Correlator{},
+		mode:        cfg.Mode,
+		log:         cfg.Logger,
+		mac:         cfg.MAC,
+		start:       time.Now(),
+		session:     cfg.Session,
+		clientID:    cfg.ClientID,
+		classifier:  cfg.Classifier,
+		correlator:  &wgbridge.Correlator{},
+		fecDisabled: cfg.FECDisabled,
+		fecForce:    cfg.FECForce,
 	}
 	e.ctx, e.cancel = context.WithCancel(context.Background())
 	if cfg.Mode == ModeClient {
@@ -100,11 +118,33 @@ func New(cfg Config) *Engine {
 		e.bind = wgbridge.NewEngineBind(e.clientSend)
 		e.reorderBuf = e.newReorder(e.clientEp)
 		e.wsched = sched.NewWeighted()
+		if !cfg.FECDisabled {
+			e.fecEnc = fec.NewEncoder(e.clientEmitParity)
+			e.fecEnc.SetParams(cfg.FECForce)
+			e.fecDec = fec.NewDecoder(func(seq uint32, ct []byte) {
+				slab := buffers.Get()
+				n := copy(*slab, ct)
+				e.reorderBuf.Push(seq, buffers.Packet{Slab: slab, Len: n})
+			})
+		}
 	} else {
 		e.server = newServerState()
 		e.bind = wgbridge.NewEngineBind(e.serverSend)
 	}
 	return e
+}
+
+// retuneFEC applies the adaptive controller (or the forced geometry) to
+// one encoder given the current path snapshots.
+func (e *Engine) retuneFEC(enc *fec.Encoder, snaps []pathmon.Snapshot) {
+	if enc == nil {
+		return
+	}
+	params := e.fecForce
+	if params.K == 0 {
+		params = fec.PickParams(pathmon.WeightedLoss(snaps))
+	}
+	enc.SetParams(params)
 }
 
 // newReorder builds a resequencing buffer that releases ciphertext (in

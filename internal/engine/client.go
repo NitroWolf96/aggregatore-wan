@@ -10,6 +10,7 @@ import (
 
 	"github.com/nitrowolf96/aggregatore-wan/internal/buffers"
 	"github.com/nitrowolf96/aggregatore-wan/internal/control"
+	"github.com/nitrowolf96/aggregatore-wan/internal/fec"
 	"github.com/nitrowolf96/aggregatore-wan/internal/pathmon"
 	"github.com/nitrowolf96/aggregatore-wan/internal/wgbridge"
 	"github.com/nitrowolf96/aggregatore-wan/internal/wire"
@@ -141,12 +142,31 @@ func (e *Engine) Run() {
 	if e.mode != ModeClient {
 		return
 	}
-	for _, loop := range []func(){e.helloLoop, e.clientProbeLoop, e.clientCtrlLoop} {
+	loops := []func(){e.helloLoop, e.clientProbeLoop, e.clientCtrlLoop}
+	if e.fecEnc != nil {
+		loops = append(loops, e.fecFlushLoop)
+	}
+	for _, loop := range loops {
 		e.wg.Add(1)
 		go func() {
 			defer e.wg.Done()
 			loop()
 		}()
+	}
+}
+
+// fecFlushLoop closes stale partial FEC groups so parity is never held
+// back on a quiet stream.
+func (e *Engine) fecFlushLoop() {
+	t := time.NewTicker(fec.FlushTimeout / 2)
+	defer t.Stop()
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case now := <-t.C:
+			e.fecEnc.Flush(now)
+		}
 	}
 }
 
@@ -222,9 +242,8 @@ func (e *Engine) clientSend(bufs [][]byte, _ *wgbridge.SessionEndpoint) error {
 		}
 		class := e.classifyCt(ct)
 
-		if len(paths) == 1 {
-			seq := e.seqFor(class)
-			e.sendDataOn(paths[0], class, false, e.session, seq, ct)
+		if len(paths) == 1 && class != wire.ClassBulk {
+			e.sendDataOn(paths[0], class, false, e.session, e.rtSeq.Add(1), fecTag{}, ct)
 			continue
 		}
 
@@ -239,41 +258,85 @@ func (e *Engine) clientSend(bufs [][]byte, _ *wgbridge.SessionEndpoint) error {
 				break // no probed path yet: fall through to weighted striping
 			}
 			seq := e.rtSeq.Add(1)
-			e.sendDataOn(paths[first], class, false, e.session, seq, ct)
+			e.sendDataOn(paths[first], class, false, e.session, seq, fecTag{}, ct)
 			if class == wire.ClassRealtime && second >= 0 {
-				e.sendDataOn(paths[second], class, true, e.session, seq, ct)
+				e.sendDataOn(paths[second], class, true, e.session, seq, fecTag{}, ct)
 			}
 			continue
 		}
 
+		var p *Path
+		if len(paths) == 1 {
+			p = paths[0]
+		} else {
+			ids := make([]uint8, len(paths))
+			weights := make([]float64, len(paths))
+			for i, pp := range paths {
+				ids[i] = pp.ID
+				weights[i] = pp.Link.Weight()
+			}
+			p = paths[e.wsched.Pick(ids, weights)]
+		}
+		seq := e.globalSeq.Add(1)
+		var tag fecTag
+		if e.fecEnc != nil {
+			if g, idx, on := e.fecEnc.Add(seq, ct, time.Now()); on {
+				tag = fecTag{on: true, group: g, index: idx}
+			}
+		}
+		e.sendDataOn(p, wire.ClassBulk, false, e.session, seq, tag, ct)
+	}
+	return nil
+}
+
+// clientEmitParity schedules one parity shard onto the weighted paths.
+func (e *Engine) clientEmitParity(group uint32, index, k, m uint8, shard []byte) {
+	paths := e.sendablePaths()
+	if len(paths) == 0 {
+		return
+	}
+	p := paths[0]
+	if len(paths) > 1 {
 		ids := make([]uint8, len(paths))
 		weights := make([]float64, len(paths))
 		for i, pp := range paths {
 			ids[i] = pp.ID
 			weights[i] = pp.Link.Weight()
 		}
-		p := paths[e.wsched.Pick(ids, weights)]
-		e.sendDataOn(p, wire.ClassBulk, false, e.session, e.globalSeq.Add(1), ct)
+		p = paths[e.wsched.Pick(ids, weights)]
 	}
-	return nil
-}
-
-// seqFor draws from the ordered bulk sequence space or the free-running
-// one used by classes that bypass the reorder buffer.
-func (e *Engine) seqFor(class uint8) uint32 {
-	if class == wire.ClassBulk {
-		return e.globalSeq.Add(1)
+	slab := buffers.Get()
+	defer buffers.Put(slab)
+	f := wire.FECHeader{
+		Header:   wire.Header{PathID: p.ID},
+		Session:  e.session,
+		Group:    group,
+		Index:    index,
+		K:        k,
+		M:        m,
+		ShardLen: uint16(len(shard)),
 	}
-	return e.rtSeq.Add(1)
+	n := wire.PutFECHeader(*slab, &f)
+	if n+len(shard) > len(*slab) {
+		return
+	}
+	c := copy((*slab)[n:], shard)
+	if err := p.write((*slab)[:n+c]); err == nil {
+		e.Stats.TxPackets.Add(1)
+		e.Stats.TxBytes.Add(uint64(n + c))
+	}
 }
 
 // sendDataOn frames one ciphertext datagram and writes it to the path.
-func (e *Engine) sendDataOn(p *Path, class uint8, dup bool, session, seq uint32, ct []byte) {
+func (e *Engine) sendDataOn(p *Path, class uint8, dup bool, session, seq uint32, tag fecTag, ct []byte) {
 	slab := buffers.Get()
 	defer buffers.Put(slab)
 	flags := wire.ClassFlags(class)
 	if dup {
 		flags |= wire.FlagDup
+	}
+	if tag.on {
+		flags |= wire.FlagFECInfo
 	}
 	d := wire.DataHeader{
 		Header:    wire.Header{Type: wire.TypeData, Flags: flags, PathID: p.ID},
@@ -281,6 +344,8 @@ func (e *Engine) sendDataOn(p *Path, class uint8, dup bool, session, seq uint32,
 		GlobalSeq: seq,
 		PathSeq:   p.pathSeq.Add(1),
 		TxTS:      e.txTS(),
+		FECGroup:  tag.group,
+		FECIndex:  tag.index,
 	}
 	n := wire.PutDataHeader(*slab, &d)
 	if n+len(ct) > len(*slab) {
@@ -345,6 +410,10 @@ func (e *Engine) handleClientDatagram(p *Path, slab *[]byte, n int) {
 		e.Stats.RxBytes.Add(uint64(n))
 		pkt := buffers.Packet{Slab: slab, Off: d.Len(), Len: len(payload)}
 		if d.Class() == wire.ClassBulk {
+			if d.Flags&wire.FlagFECInfo != 0 && e.fecDec != nil {
+				// The decoder copies the shard before Push may recycle the slab.
+				e.fecDec.AddData(d.FECGroup, d.FECIndex, d.GlobalSeq, payload, now)
+			}
 			e.reorderBuf.Push(d.GlobalSeq, pkt)
 		} else if !e.bind.Deliver(pkt, e.clientEp) {
 			// Latency-sensitive classes bypass the reorder buffer; WireGuard
@@ -352,6 +421,13 @@ func (e *Engine) handleClientDatagram(p *Path, slab *[]byte, n int) {
 			e.Stats.RxDropQueue.Add(1)
 		}
 		return
+	case wire.TypeFEC:
+		if f, shard, err := wire.ParseFEC(dgram); err == nil && f.Session == e.session && e.fecDec != nil {
+			p.lastRxNano.Store(now.UnixNano())
+			e.Stats.RxPackets.Add(1)
+			e.Stats.RxBytes.Add(uint64(n))
+			e.fecDec.AddParity(f.Group, f.Index, f.K, f.M, shard, now)
+		}
 	case wire.TypeProbe:
 		if hh, pr, ok := control.ParseProbe(dgram, e.mac); ok && pr.Session == e.session {
 			ack := control.EncodeProbeAck(wire.Header{PathID: hh.PathID},
@@ -514,14 +590,17 @@ func (e *Engine) clientCtrlLoop() {
 		if now.Sub(lastRetune) >= holdRetune {
 			lastRetune = now
 			views := make([][2]float64, 0, len(paths))
+			snaps := make([]pathmon.Snapshot, 0, len(paths))
 			for _, p := range paths {
 				if e, j, ok := p.Rx.OwdView(now, 3*time.Second); ok {
 					views = append(views, [2]float64{e, j})
 				}
+				snaps = append(snaps, p.Link.Snapshot())
 			}
 			if hold := pathmon.ComputeHold(views); hold > 0 {
 				e.reorderBuf.SetHold(hold)
 			}
+			e.retuneFEC(e.fecEnc, snaps)
 		}
 	}
 }

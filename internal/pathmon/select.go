@@ -26,6 +26,27 @@ func BestLatency(snaps []Snapshot) int {
 	return best
 }
 
+// WeightedLoss aggregates per-path loss EWMA weighted by each path's
+// traffic share, for the FEC controller.
+func WeightedLoss(snaps []Snapshot) float64 {
+	var num, den float64
+	for _, s := range snaps {
+		if !s.Up {
+			continue
+		}
+		w := s.WeightBps
+		if w <= 0 {
+			w = 1
+		}
+		num += s.LossEWMA * w
+		den += w
+	}
+	if den == 0 {
+		return 0
+	}
+	return num / den
+}
+
 // BestPair returns the indexes of the two best up paths by realtime score
 // (second is -1 when fewer than two are up).
 func BestPair(snaps []Snapshot) (int, int) {

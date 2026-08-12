@@ -46,11 +46,18 @@ func main() {
 	if !cfg.Classify.Disabled {
 		classifier = classify.New(cfg.Classify.Rules)
 	}
+	fecForce, err := cfg.FEC.Params()
+	if err != nil {
+		log.Error("config", "err", err)
+		os.Exit(1)
+	}
 	eng := engine.New(engine.Config{
-		Mode:       engine.ModeServer,
-		MAC:        wire.NewMAC(wire.DeriveKey(cfg.ControlPSK)),
-		Logger:     log,
-		Classifier: classifier,
+		Mode:        engine.ModeServer,
+		MAC:         wire.NewMAC(wire.DeriveKey(cfg.ControlPSK)),
+		Logger:      log,
+		Classifier:  classifier,
+		FECDisabled: cfg.FEC.Disabled,
+		FECForce:    fecForce,
 	})
 
 	wg, err := wgbridge.NewWG(cfg.Tunnel, eng.Bind(), eng.Inspect(), log, false)

@@ -11,6 +11,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/nitrowolf96/aggregatore-wan/internal/classify"
+	"github.com/nitrowolf96/aggregatore-wan/internal/fec"
 )
 
 // DefaultMTU is the tunnel MTU: 1428 (typical 4G APN MTU) minus the worst
@@ -39,6 +40,20 @@ type Path struct {
 type Dashboard struct {
 	Listen string `yaml:"listen"` // empty disables it
 	Token  string `yaml:"token"`  // optional bearer token
+}
+
+// FEC configures forward error correction of the bulk stream.
+type FEC struct {
+	Disabled bool   `yaml:"disabled"`
+	Force    string `yaml:"force"` // fixed "k:m" geometry; empty = adaptive
+}
+
+// Params resolves the forced geometry (zero when adaptive).
+func (f *FEC) Params() (fec.Params, error) {
+	if f.Force == "" {
+		return fec.Params{}, nil
+	}
+	return fec.ParseForce(f.Force)
 }
 
 // Classify configures per-flow classification.
@@ -71,6 +86,7 @@ type Client struct {
 	ControlPSK string    `yaml:"control_psk"`
 	Paths      []Path    `yaml:"paths"`
 	Classify   Classify  `yaml:"classify"`
+	FEC        FEC       `yaml:"fec"`
 	Dashboard  Dashboard `yaml:"dashboard"`
 }
 
@@ -80,6 +96,7 @@ type Server struct {
 	Listen     string    `yaml:"listen"`
 	ControlPSK string    `yaml:"control_psk"`
 	Classify   Classify  `yaml:"classify"`
+	FEC        FEC       `yaml:"fec"`
 	Dashboard  Dashboard `yaml:"dashboard"`
 }
 
@@ -138,6 +155,9 @@ func LoadClient(path string) (*Client, error) {
 	if err := c.Classify.validate(); err != nil {
 		return nil, err
 	}
+	if _, err := c.FEC.Params(); err != nil {
+		return nil, err
+	}
 	seen := map[string]bool{}
 	for i := range c.Paths {
 		p := &c.Paths[i]
@@ -174,6 +194,9 @@ func LoadServer(path string) (*Server, error) {
 		return nil, fmt.Errorf("control_psk is required")
 	}
 	if err := s.Classify.validate(); err != nil {
+		return nil, err
+	}
+	if _, err := s.FEC.Params(); err != nil {
 		return nil, err
 	}
 	return &s, nil
